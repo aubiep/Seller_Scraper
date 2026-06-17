@@ -1,0 +1,8 @@
+# PropIntel dependencies. Install on a new workstation with:
+#   python -m pip install -r requirements.txt
+# Tested on Python 3.14 (works on 3.12+). kc_lookup uses only the stdlib.
+requests>=2.31
+beautifulsoup4>=4.12
+openpyxl>=3.1
+flask>=3.0
+pyyaml>=6.0

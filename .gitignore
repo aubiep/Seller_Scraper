@@ -1,0 +1,44 @@
+# ============================================================================
+#  PropIntel .gitignore  -  CODE ONLY. Never commit secrets, the database, or
+#  any client PII. This repo is safe to push to a PRIVATE GitHub only after
+#  confirming `git ls-files` shows no config/db/PII (see the commit checklist).
+# ============================================================================
+
+# --- Secrets (API keys, tokens, credentials) ---
+config/
+config.txt
+
+# --- Database + anything carrying client PII (names/emails/phones/addresses) ---
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+backups/
+imports/
+property_photos/
+*.xlsx
+*.csv
+Seller_Leads*.txt
+addresses.txt
+lead_watcher_state.json
+
+# --- Generated logs / previews (contain real lead data) ---
+_*.json
+_*.txt
+*preview*.json
+
+# --- Changelogs contain owner names + addresses (PII) -> keep local only ---
+CHANGELOG*.md
+
+# --- iAuto letter templates (carry personal contact info; data not code) ---
+Iauto/
+
+# --- Stale / non-core / vendor dirs ---
+Project_Downloads/
+HomebotAPI/
+.claude/
+
+# --- Python ---
+__pycache__/
+*.pyc
+*.pyo
