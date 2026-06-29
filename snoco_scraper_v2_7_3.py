@@ -1,8 +1,26 @@
 """
-Property Tax Record Scraper  v2.7.2
+Property Tax Record Scraper  v2.7.3
 ====================================
 Automated property data extraction for Snohomish County AND King County.
 County is auto-detected from the address city name.
+
+v2.7.3 Changes (King County condominium / townhome leads):
+    - FIXED: condo/townhome leads landed as UNENRICHED. King County's address
+      layer maps a unit's street address to the condominium COMPLEX MASTER parcel
+      (MINOR 0000), which is common area carrying no owner and no value. The
+      scraper fetched that empty master, got no owner, and could not match. It now
+      detects the owner-less master, confirms via GIS land-use that it is a
+      condominium, enumerates the per-unit parcels (MAJOR-00X0), and matches the
+      lead to their unit by surname (disambiguated by first name when a surname
+      repeats). Recovers e.g. '26810 NE Big Rock Rd' -> unit 729910-0090 (LESTER
+      DEAN T, $818K, "Ridge at Big Rock Duv Condo").
+    - A lead with no name, a non-condo owner-less parcel, or an absent/ambiguous
+      unit match is left as-is (UNENRICHED) rather than guessing a wrong unit -
+      consistent with the project's "never silently match the wrong property" rule.
+      (e.g. '14715 1st Lane NE' / Michael Hoar, who owns no unit in that complex.)
+    - Condo unit pages carry owner + assessed value but usually no beds/baths/year
+      and no street address; the complex street from the GIS resolve is preserved
+      for display, so enrichment is verified-ownership grade for these.
 
 v2.7.2 Changes (address-matching robustness):
     - FIXED: clean_address_for_search truncated streets whose name starts with a
@@ -1166,6 +1184,10 @@ KC_ARCGIS_ADDRPTS = ("https://gismaps.kingcounty.gov/arcgis/rest/services/"
                      "Address/KingCo_AddressPoints/MapServer/0/query")
 KC_DASHBOARD_URL = ("https://blue.kingcounty.com/Assessor/eRealProperty/"
                     "Dashboard.aspx?ParcelNbr=")
+# GIS land-use, used to confirm an owner-less master parcel is a condominium
+# (layer 2 = Parcels, field PREUSE_DESC) before walking its units.
+KC_PROPINFO_URL = ("https://gismaps.kingcounty.gov/arcgis/rest/services/"
+                   "Property/KingCo_PropertyInfo/MapServer/2/query")
 
 
 def kc_resolve_address_live(address, timeout=20):
@@ -1233,6 +1255,111 @@ def kc_fetch_dashboard_live(pin, timeout=20):
     return data, session
 
 
+def kc_is_condo(pin, timeout=15):
+    """True if the parcel's King County GIS land use is a condominium. Used to
+    confirm an owner-less master parcel really is a condo complex before spending
+    requests walking its units (vs. e.g. a vacant or exempt parcel)."""
+    try:
+        resp = requests.get(KC_PROPINFO_URL, params={
+            "where": f"PIN='{pin}'", "outFields": "PREUSE_DESC",
+            "returnGeometry": "false", "f": "json"},
+            headers=HTTP_HEADERS, timeout=timeout)
+        feats = resp.json().get("features", [])
+    except Exception:
+        return False
+    if not feats:
+        return False
+    desc = (feats[0].get("attributes", {}).get("PREUSE_DESC") or "").upper()
+    return "CONDO" in desc
+
+
+def _kc_unit_owner(pin, session, timeout=12):
+    """Fetch just the owner-name split for one candidate condo-unit PIN. Returns a
+    split_owner_names() dict, or None when the PIN has no assessor record or no
+    name (i.e. a gap past the last real unit)."""
+    try:
+        r = session.get(KC_DASHBOARD_URL + pin, timeout=timeout)
+        r.raise_for_status()
+    except Exception:
+        return None
+    soup = BeautifulSoup(r.text, "html.parser")
+    header = soup.find("table", id="cphContent_DetailsViewDashboardHeader")
+    if not header:
+        return None
+    name = ""
+    for row in header.find_all("tr"):
+        cells = row.find_all("td")
+        if len(cells) == 2 and cells[0].text.strip() == "Name":
+            name = cells[1].text.strip()
+            break
+    return split_owner_names(name) if name else None
+
+
+def kc_resolve_condo_unit(master_pin, lead_data, session=None):
+    """A condo/townhome street address resolves (via the KC address layer) to the
+    complex MASTER parcel, MINOR 0000 - common area with no owner or value. The
+    real owner + value live in per-unit parcels MAJOR-00X0. Walk the units and
+    return the PIN of the one owned by THIS lead, matched by surname and
+    disambiguated by first name when a surname repeats in the complex.
+
+    Returns None - leaving the lead UNENRICHED rather than guessing - when there
+    is no lead name to match on, the parcel is not a condo, or the unit match is
+    absent or ambiguous. This upholds the project rule against silently attaching
+    a wrong property."""
+    if not lead_data:
+        return None
+    ll = (lead_data.get("Lead Last Name") or "").upper().strip()
+    lf = (lead_data.get("Lead First Name") or "").upper().strip()
+    if not ll or not kc_is_condo(master_pin):
+        return None
+
+    sess = session
+    if sess is None:
+        sess = requests.Session()
+        sess.headers.update(HTTP_HEADERS)
+    major = master_pin[:6]
+
+    # Condo unit minors are assigned in multiples of 10 (0010, 0020, ...). Walk
+    # them and stop after a run of empties once the unit block has been seen.
+    units = []  # (pin, owner_dict)
+    empty_run = 0
+    for m in range(10, 2001, 10):
+        owner = _kc_unit_owner(f"{major}{m:04d}", sess)
+        if owner:
+            units.append((f"{major}{m:04d}", owner))
+            empty_run = 0
+        elif units:
+            empty_run += 1
+            if empty_run >= 12:
+                break
+    # Fallback for the rarer complexes that number units sequentially (0001, 0002).
+    if not units:
+        for m in range(1, 61):
+            owner = _kc_unit_owner(f"{major}{m:04d}", sess)
+            if owner:
+                units.append((f"{major}{m:04d}", owner))
+
+    def lastnames(o):
+        return {(o.get("Owner 1 Last Name") or "").upper().strip(),
+                (o.get("Owner 2 Last Name") or "").upper().strip()}
+
+    def firstnames(o):
+        return {(o.get("Owner 1 First Name") or "").upper().strip(),
+                (o.get("Owner 2 First Name") or "").upper().strip()}
+
+    matches = [(pin, o) for pin, o in units if ll in lastnames(o)]
+    if len(matches) > 1 and lf:
+        narrowed = [(pin, o) for pin, o in matches if lf in firstnames(o)]
+        if narrowed:
+            matches = narrowed
+    if len(matches) != 1:
+        if matches:
+            print(f"  [WARNING] Condo unit match for '{lf} {ll}' was ambiguous "
+                  f"({len(matches)} candidates); left unenriched.")
+        return None
+    return matches[0][0]
+
+
 def lookup_property_kc_live(address, lead_data=None, api_key=None,
                             photo_folder="property_photos"):
     """Live King County lookup: ArcGIS address->PIN, then a Dashboard GET.
@@ -1256,6 +1383,24 @@ def lookup_property_kc_live(address, lead_data=None, api_key=None,
     if not data:
         print(f"  [ERROR] No live assessor record for PIN {resolved['pin']}")
         return None
+
+    # Condo / townhome complex: the address resolved to the MASTER parcel (common
+    # area, MINOR 0000), which has no owner and no value. Find the lead's actual
+    # unit parcel. This is a no-op for ordinary parcels, which already carry an
+    # owner here, so the extra GIS/unit requests only fire for condo-shaped misses.
+    if not (data.get("Owner 1 Last Name") or "").strip():
+        unit_pin = kc_resolve_condo_unit(resolved["pin"], lead_data, session)
+        if unit_pin:
+            unit_data, unit_session = kc_fetch_dashboard_live(unit_pin)
+            if unit_data and (unit_data.get("Owner 1 Last Name") or "").strip():
+                print(f"  -> Condo master {resolved['pin']} is common area; "
+                      f"matched lead to unit {unit_pin}")
+                # Unit pages carry owner + value but usually no street address;
+                # keep the complex street from the GIS resolve for display.
+                if not (unit_data.get("Property Address") or "").strip():
+                    unit_data["Property Address"] = resolved["addr_full"]
+                    unit_data["Property Street"] = resolved["addr_full"]
+                data, session = unit_data, unit_session
 
     # GIS supplies a more reliable city/zip than the Dashboard's Site Address
     # (which has no city). Rebuild the canonical address from the GIS pieces.
@@ -1990,7 +2135,7 @@ def main():
         sys.exit(1)
 
     # --- Setup ---
-    print(f"\nProperty Tax Scraper v2.7.2 (Snohomish web + King County LIVE)")
+    print(f"\nProperty Tax Scraper v2.7.3 (Snohomish web + King County LIVE)")
     print(f"{'='*50}")
     print(f"Properties to look up: {len(lookups)}")
 
