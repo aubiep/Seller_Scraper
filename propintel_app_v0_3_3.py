@@ -1,5 +1,5 @@
 """
-PropIntel Dashboard  v0.3.2
+PropIntel Dashboard  v0.3.3
 ===========================
 A local web app over propintel.db. Runs entirely on your machine; the only
 outbound actions are ones you trigger: Homebot enrollment and iAuto letter sends.
@@ -7,7 +7,7 @@ This is the unified-app home: see leads, work the review queue, pull mailing
 lists, queue and send iAuto handwritten notes, and enroll seller leads on Homebot.
 
 Run:
-    python propintel_app_v0_3_2.py
+    python propintel_app_v0_3_3.py
 Then open http://127.0.0.1:5000 (this PC) or http://<this-PC-LAN-IP>:5000
 (a phone/tablet on the same WiFi - the startup prints the exact URL).
 
@@ -22,6 +22,19 @@ Screens:
     /letters/bulk  Bulk mail - filter a lead list, then queue letters in one pass
     /homebot       Homebot - enroll verified seller leads on the Market Digest
     /contacts      -> redirects to /leads (merged in v0.3.0)
+
+New in v0.3.3 (supersedes v0.3.2):
+    - "Re-run assessor lookup" button on every lead row of the property detail
+      page (POST /lead/<cid>/<pid>/reenrich -> reenrich_v0_1_0.reenrich). On a
+      match it upgrades the property in place (real parcel + owner + value) and
+      flips the verdict, preserving the original lead date - the manual condo
+      re-enrichment, now one click. On a failure it stores WHAT the assessor
+      returned (owner found that didn't match, candidate condo unit owners, or
+      "no parcel found") in properties.last_lookup_* (schema v4).
+    - "Last assessor lookup" panel on the property detail page shows that stored
+      outcome (status + detail + timestamp), so a failed re-run is visible and
+      explained instead of silent. The /leads verdict filter (UNENRICHED /
+      MISMATCH / REVIEW) remains the all-failures list.
 
 New in v0.3.2 (supersedes v0.3.1):
     - Serves on the local network (binds 0.0.0.0), so a phone/tablet on the same
@@ -104,6 +117,7 @@ import iauto_send_v0_1_0 as iautosend
 import propintel_backup_v0_1_0 as backup
 import lead_priority_v0_1_0 as priority
 import geocode_v0_1_0 as geocode
+import reenrich_v0_1_0 as reenrich
 
 app = Flask(__name__)
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), pdb.DEFAULT_DB_FILENAME)
@@ -1111,6 +1125,29 @@ def photo(pid, which):
     return send_file(path)
 
 
+@app.route("/lead/<int:cid>/<int:pid>/reenrich", methods=["POST"])
+def lead_reenrich(cid, pid):
+    """Re-run the county assessor lookup for one lead (reenrich_v0_1_0). On a
+    match the property is upgraded in place and the verdict flips, preserving the
+    original lead date; on a failure the stored 'Last assessor lookup' panel on
+    the detail page explains what the assessor returned and why it didn't match."""
+    conn = db()
+    try:
+        result = reenrich.reenrich(conn, cid, pid)
+    except Exception as e:  # never leave the user on a 500 from a lookup hiccup
+        conn.close()
+        return redirect(url_for("property_detail", pid=pid,
+                                msg=f"Re-run failed to run: {e}"))
+    conn.close()
+    eff_pid = result.get("property_id") or pid
+    if result["status"] == "MATCHED":
+        msg = "Re-run matched and updated this lead in place. Details below."
+    else:
+        msg = (f"Re-run finished: {result['status']}. See 'Last assessor lookup' "
+               "below for what the assessor returned.")
+    return redirect(url_for("property_detail", pid=eff_pid, msg=msg))
+
+
 @app.route("/property/<int:pid>")
 def property_detail(pid):
     conn = db()
@@ -1190,10 +1227,16 @@ def property_detail(pid):
             "<input type='hidden' name='template' value='seller_lead_initial'>"
             "<button class='sm'>Queue iAuto letter</button></form>")
         enroll_btn = homebot_action_cell(conn, le["contact_id"], pid, hb_status, next_pid=pid)
+        reenrich_btn = (
+            "<form class='rowform' method='post' action='/lead/"
+            f"{le['contact_id']}/{pid}/reenrich' "
+            "onsubmit=\"return confirm('Re-run the county assessor lookup for "
+            f"{esc(name)}? This can take several seconds.');\">"
+            "<button class='sm ghost'>Re-run assessor lookup</button></form>")
         lead_rows += (
             f"<tr><td><b>{esc(name)}</b> "
             f"<a class='back' href='/contact/{le['contact_id']}/edit?next_pid={pid}'>edit</a>"
-            f"<div class='mut'>{esc(le['contact_type'] or '')}</div></td>"
+            f"<div class='mut'>{esc(le['contact_type'] or '')}</div>{reenrich_btn}</td>"
             f"<td>{pill(le['ownership_match'] or '—')}"
             f"<div class='mut'>{esc(le['match_confidence'])} &middot; {esc(le['match_relationship'] or '')}</div></td>"
             f"<td class='mut'>{esc(le['email'] or '')}<br>{esc(le['phone'] or '')}</td>"
@@ -1208,11 +1251,30 @@ def property_detail(pid):
 
     addr = p["property_address"] or p["property_street"] or f"Property #{pid}"
     banner = f"<div class='banner'>{esc(msg)}</div>" if msg else ""
+
+    # "Last assessor lookup" panel: the stored outcome of the most recent re-run,
+    # so a failed re-enrichment shows what the assessor returned (and why it
+    # didn't match) instead of disappearing.
+    pk = p.keys()
+    lookup_panel = ""
+    if "last_lookup_at" in pk and p["last_lookup_at"]:
+        st = p["last_lookup_status"] or ""
+        st_cls = {"MATCHED": "CONFIRMED", "NO MATCH": "MISMATCH",
+                  "ERROR": "MISMATCH", "NO ADDRESS": "REVIEW"}.get(st, "NO")
+        lookup_panel = (
+            "<div class='detail-grid' style='margin:12px 0'>"
+            "<div class='kv' style='grid-column:1/-1'>"
+            f"<div class='k'>Last assessor lookup &nbsp;"
+            f"<span class='pill {st_cls}'>{esc(st)}</span></div>"
+            f"<div class='v' style='font-weight:400'>{esc(p['last_lookup_detail'] or '')}"
+            f"<div class='mut' style='margin-top:4px'>checked {esc(p['last_lookup_at'])}</div>"
+            "</div></div></div>")
+
     body = (
         "<a class='back' href='/leads'>&larr; back to leads</a>"
         f"<h2 style='margin-top:8px'>{esc(addr)}</h2>"
         f"<div class='sub'>{esc(p['county'] or '')} &middot; parcel {esc(p['parcel_number'] or '—')}</div>"
-        f"{banner}{photos}"
+        f"{banner}{lookup_panel}{photos}"
         f"<h2>Owner of record</h2><div class='detail-grid'>{owner_grid}</div>"
         f"<h2>Property</h2><div class='detail-grid'>{facts}</div>"
         f"<h2>Valuation &amp; sales</h2><div class='detail-grid'>{values}{sale_blob}</div>"

@@ -44,7 +44,7 @@ import os
 import sys
 from datetime import datetime
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 DEFAULT_DB_FILENAME = "propintel.db"
 
 
@@ -126,6 +126,9 @@ CREATE TABLE IF NOT EXISTS properties (
     longitude                REAL,
     geocode_source           TEXT DEFAULT '',
     geocoded_at              TEXT DEFAULT '',
+    last_lookup_at           TEXT DEFAULT '',
+    last_lookup_status       TEXT DEFAULT '',
+    last_lookup_detail       TEXT DEFAULT '',
     first_retrieved          TEXT DEFAULT '',
     last_retrieved           TEXT DEFAULT '',
     updated_at               TEXT DEFAULT '',
@@ -304,12 +307,18 @@ def _migrate(conn):
             conn.execute(f"ALTER TABLE lead_events ADD COLUMN {col} {decl}")
 
     # Schema v3: property coordinates for radius / map filtering (geocode module).
+    # Schema v4: last re-run assessor-lookup outcome (status + human-readable
+    # detail of what was found), surfaced on the lead detail page so a failed
+    # re-enrichment shows what the assessor returned instead of just failing.
     have_p = {r["name"] for r in conn.execute("PRAGMA table_info(properties)")}
     prop_additions = [
         ("latitude", "REAL"),
         ("longitude", "REAL"),
         ("geocode_source", "TEXT DEFAULT ''"),
         ("geocoded_at", "TEXT DEFAULT ''"),
+        ("last_lookup_at", "TEXT DEFAULT ''"),
+        ("last_lookup_status", "TEXT DEFAULT ''"),
+        ("last_lookup_detail", "TEXT DEFAULT ''"),
     ]
     for col, decl in prop_additions:
         if col not in have_p:
