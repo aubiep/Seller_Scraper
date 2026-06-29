@@ -1,8 +1,18 @@
 """
-Property Tax Record Scraper  v2.7.3
+Property Tax Record Scraper  v2.7.4
 ====================================
 Automated property data extraction for Snohomish County AND King County.
 County is auto-detected from the address city name.
+
+v2.7.4 Changes (King County direction-in-street-name resolve):
+    - FIXED: a King County address whose STREET NAME contains a direction word
+      failed to resolve. kc_normalize_address abbreviates EAST->E (etc.), but for
+      streets like "East Ames Lake Drive" the county stores the full word
+      ('3120 EAST AMES LAKE DR NE'), so the exact/prefix ADDR_FULL match missed.
+      kc_resolve_address_live now adds a relaxed fallback: house number + the core
+      street-name words (directionals and street types dropped), accepted ONLY
+      when exactly one parcel matches, so it recovers these without ever silently
+      grabbing a wrong parcel. (3120 E Ames Lake Dr -> parcel 0203101295.)
 
 v2.7.3 Changes (King County condominium / townhome leads):
     - FIXED: condo/townhome leads landed as UNENRICHED. King County's address
@@ -1190,6 +1200,33 @@ KC_PROPINFO_URL = ("https://gismaps.kingcounty.gov/arcgis/rest/services/"
                    "Property/KingCo_PropertyInfo/MapServer/2/query")
 
 
+# Direction words and street-type abbreviations dropped when building the
+# relaxed King County address fallback (so the match keys on the core name).
+_KC_DIRECTIONS = {"N", "S", "E", "W", "NE", "NW", "SE", "SW"}
+_KC_STREET_TYPES = {"ST", "AVE", "DR", "RD", "LN", "CT", "PL", "BLVD", "CIR",
+                    "TER", "PKWY", "HWY", "WY", "WAY", "CV", "LOOP", "RUN",
+                    "PT", "TRL", "XING", "SQ"}
+
+
+def _kc_relaxed_where(norm):
+    """Build a relaxed ArcGIS WHERE keyed on house number + the core street-name
+    words (directionals and street types removed). Used only as a fallback for
+    streets whose name carries a direction word that normalization abbreviates
+    (e.g. 'East Ames Lake Dr'). Returns None when there isn't enough to be safe
+    (need a leading house number plus at least one name word)."""
+    parts = norm.split()
+    if len(parts) < 2 or not parts[0].isdigit():
+        return None
+    hn = parts[0].replace("'", "''")
+    core = [w for w in parts[1:]
+            if w not in _KC_DIRECTIONS and w not in _KC_STREET_TYPES]
+    if not core:
+        return None
+    likes = " AND ".join("ADDR_FULL LIKE '%{}%'".format(w.replace("'", "''"))
+                         for w in core)
+    return "ADDR_FULL LIKE '{} %' AND {}".format(hn, likes)
+
+
 def kc_resolve_address_live(address, timeout=20):
     """Resolve a street address to a King County parcel via the public ArcGIS
     AddressPoints layer. Returns {pin, addr_full, city, zip} or None.
@@ -1201,6 +1238,12 @@ def kc_resolve_address_live(address, timeout=20):
     unincorporated parcels (e.g. Fall City) where the assessor's DistrictName
     is blank.
 
+    v2.7.4: when both anchored matches miss, a relaxed fallback keyed on house
+    number + core street-name words recovers direction-in-name streets (where
+    normalization abbreviated a name word, e.g. EAST->E). The fallback is
+    accepted only when it returns exactly one parcel, so it never silently grabs
+    a wrong parcel.
+
     The incoming address carries the city/state/zip (it's the RAW lead
     address, needed for county routing). clean_address_for_search() strips that
     down to the street so ADDR_FULL can match, the same prep the Snohomish path
@@ -1210,29 +1253,52 @@ def kc_resolve_address_live(address, timeout=20):
         return None
     safe = norm.replace("'", "''")
     fields = "PIN,ADDR_FULL,ZIP5,CTYNAME,POSTALCTYNAME"
-    for where in (f"ADDR_FULL = '{safe}'", f"ADDR_FULL LIKE '{safe}%'"):
+
+    def _query(where, record_count=5):
         try:
             resp = requests.get(KC_ARCGIS_ADDRPTS, params={
                 "where": where, "outFields": fields,
-                "returnGeometry": "false", "f": "json", "resultRecordCount": 5,
+                "returnGeometry": "false", "f": "json",
+                "resultRecordCount": record_count,
             }, headers=HTTP_HEADERS, timeout=timeout)
             resp.raise_for_status()
-            feats = resp.json().get("features", [])
+            return resp.json().get("features", [])
         except Exception as e:
             print(f"  [WARNING] KC ArcGIS query failed: {e}")
             return None
+
+    def _result(feat):
+        a = feat.get("attributes", {})
+        pin = str(a.get("PIN", "") or "").strip()
+        if not pin:
+            return None
+        city = (a.get("POSTALCTYNAME") or a.get("CTYNAME") or "").strip()
+        return {
+            "pin": pin,
+            "addr_full": (a.get("ADDR_FULL") or "").strip(),
+            "city": smart_title_case(city) if city else "",
+            "zip": str(a.get("ZIP5", "") or "").strip(),
+        }
+
+    # 1) exact, then 2) prefix LIKE - anchored, so the first hit is trustworthy.
+    for where in (f"ADDR_FULL = '{safe}'", f"ADDR_FULL LIKE '{safe}%'"):
+        feats = _query(where)
+        if feats is None:
+            return None
         if feats:
-            a = feats[0].get("attributes", {})
-            pin = str(a.get("PIN", "") or "").strip()
-            if not pin:
-                continue
-            city = (a.get("POSTALCTYNAME") or a.get("CTYNAME") or "").strip()
-            return {
-                "pin": pin,
-                "addr_full": (a.get("ADDR_FULL") or "").strip(),
-                "city": smart_title_case(city) if city else "",
-                "zip": str(a.get("ZIP5", "") or "").strip(),
-            }
+            r = _result(feats[0])
+            if r:
+                return r
+
+    # 3) relaxed fallback - accept only an unambiguous (single) match.
+    relaxed = _kc_relaxed_where(norm)
+    if relaxed:
+        feats = _query(relaxed, record_count=3)
+        if feats and len(feats) == 1:
+            r = _result(feats[0])
+            if r:
+                print(f"  -> KC matched via relaxed address fallback: {r['addr_full']}")
+                return r
     return None
 
 
@@ -2135,7 +2201,7 @@ def main():
         sys.exit(1)
 
     # --- Setup ---
-    print(f"\nProperty Tax Scraper v2.7.3 (Snohomish web + King County LIVE)")
+    print(f"\nProperty Tax Scraper v2.7.4 (Snohomish web + King County LIVE)")
     print(f"{'='*50}")
     print(f"Properties to look up: {len(lookups)}")
 
