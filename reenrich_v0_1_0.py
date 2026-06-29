@@ -16,7 +16,7 @@ the connection; reenrich() commits its own change.
 import os
 
 import propintel_db_v0_1_0 as pdb
-import snoco_scraper_v2_7_4 as scraper
+import snoco_scraper_v2_8_0 as scraper
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -70,9 +70,11 @@ def _diagnose_failure(address, county, lead_data, owner_less_master=False):
     matching owner, including what the assessor DID return."""
     ll = pdb._norm(lead_data.get("Lead Last Name")) or "(no name)"
     if county != "king":
-        return (f"Snohomish County returned no matching parcel for '{address}'. "
-                "Verify the street number/spelling, or check the owner manually on "
-                "snoco.org and correct the address via Edit contact.")
+        return (f"Snohomish County's Public Access portal returned no unambiguous "
+                f"match for '{address}'. Verify the street number/spelling (the "
+                "portal matches on house number + street name), or look it up at "
+                "wa-snohomish.publicaccessnow.com and correct the address via Edit "
+                "contact.")
     resolved = scraper.kc_resolve_address_live(address)
     if not resolved:
         return (f"King County's address layer found no parcel for '{address}'. "

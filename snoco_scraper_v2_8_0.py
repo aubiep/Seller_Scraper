@@ -1,8 +1,26 @@
 """
-Property Tax Record Scraper  v2.7.4
+Property Tax Record Scraper  v2.8.0
 ====================================
 Automated property data extraction for Snohomish County AND King County.
 County is auto-detected from the address city name.
+
+v2.8.0 Changes (Snohomish County moved to the Public Access portal):
+    - REBUILT the Snohomish path. The county retired the old snoco.org/proptax
+      ASP.NET site (every lookup 404'd, the whole Snohomish pipeline was down).
+      Property data now comes from the hosted Public Access portal's QuickSearch
+      JSON API: get_session() primes the page for the DNN auth context (TabId +
+      anti-forgery token); scrape_property() calls
+      /DesktopModules/QuickSearch/API/Module/GetData?keywords=<house# + street
+      name>&page=1 and maps the result to the master schema. Keywords drop street
+      types/directions (the portal matches better that way); results are filtered
+      to the input street and disambiguated by city, skipping ambiguous matches
+      rather than guessing. get_session()/scrape_property() keep their old
+      signatures, so main(), reenrich, and lead_intake call them unchanged.
+    - The public search result carries parcel + owner + situs (enough for
+      ownership verification). Rich assessor detail (assessed value, beds/baths,
+      year, sale history) is NOT exposed by the public search API and is left
+      blank, the same as a structure-less parcel. (A future enhancement could
+      pull it from the Aumentum detail module.) King County is unchanged.
 
 v2.7.4 Changes (King County direction-in-street-name resolve):
     - FIXED: a King County address whose STREET NAME contains a direction word
@@ -300,7 +318,14 @@ from datetime import datetime
 #  CONFIGURATION
 # ═══════════════════════════════════════════════════════════════════════════════
 
-BASE_URL    = "https://www.snoco.org/proptax/"
+# Snohomish County Public Access portal (v2.8.0). The old snoco.org/proptax
+# ASP.NET site was retired; property data now comes from this hosted portal's
+# QuickSearch JSON API (DNN/Aumentum). The search returns parcel + owner + situs.
+SNOHO_BASE        = "https://wa-snohomish.publicaccessnow.com"
+SNOHO_SEARCH_PAGE = SNOHO_BASE + "/PropertyInformation/PropertySearch.aspx?moduleId=470"
+SNOHO_GETDATA     = SNOHO_BASE + "/DesktopModules/QuickSearch/API/Module/GetData"
+SNOHO_MODULE_ID   = "470"
+
 OUTPUT_CSV  = "snoco_property_data.csv"
 OUTPUT_XLSX = "snoco_property_data.xlsx"
 
@@ -785,307 +810,40 @@ def build_lead_data(lead):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  ASSESSOR WEBSITE INTERACTION (Snohomish County)
+#  ASSESSOR WEBSITE INTERACTION (Snohomish County - Public Access portal, v2.8.0)
+# ═══════════════════════════════════════════════════════════════════════════════
+#  The retired snoco.org/proptax WebForms site is gone. Property data now comes
+#  from the hosted Public Access portal's QuickSearch JSON API. get_session()
+#  primes the search page to capture the DNN ServicesFramework auth context
+#  (TabId + anti-forgery token) that the API requires, and scrape_property()
+#  calls the API. Both keep their old signatures so main(), reenrich, and
+#  lead_intake call them unchanged. The search result carries parcel + owner +
+#  situs (enough for ownership verification); rich assessor detail (value, beds,
+#  baths, year) is not exposed by the public search API and is left blank.
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def get_session():
-    """Open a session to the Snohomish County assessor site."""
+    """Prime a session against the Snohomish Public Access portal and capture the
+    auth context the search API needs. Returns (session, ctx) where ctx is the
+    header dict passed as `base_resp` to scrape_property(). Raises on an
+    unreachable portal or missing tokens (callers already wrap this in try/except)."""
     session = requests.Session()
     session.headers.update(HTTP_HEADERS)
-    resp = session.get(BASE_URL, allow_redirects=True)
+    resp = session.get(SNOHO_SEARCH_PAGE, timeout=20)
     resp.raise_for_status()
-    return session, resp
+    html = resp.text
+    rvt = re.search(r'name="__RequestVerificationToken"[^>]*value="([^"]+)"', html)
+    tab = re.search(r"sf_tabId[^0-9]{0,4}(\d+)", html)
+    if not rvt or not tab:
+        raise RuntimeError("Snohomish portal: could not read auth tokens "
+                           "(site layout changed?)")
+    ctx = {"ModuleId": SNOHO_MODULE_ID, "TabId": tab.group(1),
+           "RequestVerificationToken": rvt.group(1)}
+    return session, ctx
 
 
-def _extract_asp_fields(html):
-    """Pull ASP.NET hidden form fields for POST."""
-    soup = BeautifulSoup(html, "html.parser")
-    return {
-        name: tag.get("value", "")
-        for name in ("__VIEWSTATE", "__VIEWSTATEGENERATOR",
-                      "__EVENTVALIDATION", "__EVENTTARGET", "__EVENTARGUMENT")
-        if (tag := soup.find("input", {"name": name}))
-    }
-
-
-def search_address(session, address, base_resp):
-    """Submit an address search and return the response."""
-    fields = _extract_asp_fields(base_resp.text)
-    form = {**fields, "mParcelID": "", "mStreetAddress": address,
-            "mCity": "", "mStateProvince": "", "mPostalCode": "",
-            "mSubmit": "Parcel Info"}
-    resp = session.post(base_resp.url, data=form, allow_redirects=True)
-    resp.raise_for_status()
-    return resp
-
-
-def parse_search_results(resp):
-    """Extract parcel links from the search results page."""
-    soup = BeautifulSoup(resp.text, "html.parser")
-    if "ParcelInfo.aspx" in resp.url or "Property Account Summary" in resp.text:
-        return [("DIRECT", resp)]
-    results = []
-    for link in soup.find_all("a"):
-        href = link.get("href", "")
-        if "ParcelInfo" in href and "parcel_number" in href:
-            parcel = link.text.strip()
-            row = link.find_parent("tr")
-            addr = ""
-            if row:
-                cells = row.find_all("td")
-                if len(cells) >= 2:
-                    addr = cells[1].text.strip()
-            results.append((parcel, addr, urljoin(resp.url, href)))
-    return results
-
-
-def _find_table(tables, *keywords):
-    """Find the smallest table whose text contains ALL keywords."""
-    matches = [t for t in tables if all(kw in t.text for kw in keywords)]
-    return min(matches, key=lambda t: len(t.text)) if matches else None
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  PARCEL PAGE PARSING (Snohomish County)
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def parse_parcel_page(html, url):
-    """Extract all property data from ParcelInfo.aspx.
-    Returns (data_dict, structure_detail_url)."""
-    soup = BeautifulSoup(html, "html.parser")
-    data = {}
-    tables = soup.find_all("table")
-
-    # --- Parcel Number & Address ---
-    t = soup.find("table", class_="OutputTable")
-    if t:
-        cells = [c.text.strip() for c in t.find_all("td")]
-        for i, c in enumerate(cells):
-            if c == "Parcel Number" and i+1 < len(cells):
-                data["Parcel Number"] = cells[i+1]
-            if c == "Property Address" and i+1 < len(cells):
-                data["Property Address"] = cells[i+1]
-
-    # --- Parse full address into components ---
-    if data.get("Property Address"):
-        data.update(parse_full_address(data["Property Address"]))
-
-    # --- General Information ---
-    t = _find_table(tables, "Property Description", "Property Category", "Tax Code Area")
-    if t:
-        for row in t.find_all("tr"):
-            cells = row.find_all("td")
-            if len(cells) == 2:
-                lbl, val = cells[0].text.strip(), cells[1].text.strip()
-                if lbl in ("Property Description", "Property Category", "Status", "Tax Code Area"):
-                    data[lbl] = val
-
-    # --- Subdivision Name ---
-    desc = data.get("Property Description", "")
-    if desc and not desc.upper().startswith("SEC "):
-        parts = re.split(
-            r'\s+[Bb][Ll][Kk]\s+|\s+-\s+[Ll][Oo][Tt]\s+|\s+[Ll][Oo][Tt]\s+\d|\s+-\s+[Uu]nit\s+',
-            desc, maxsplit=1)
-        sub = parts[0].strip() if parts else ""
-        data["Subdivision Name"] = re.sub(r',\s*Corrected Plat Of\s*$', '', sub, flags=re.I).strip()
-    else:
-        data["Subdivision Name"] = ""
-
-    # --- Property Characteristics ---
-    t = _find_table(tables, "Use Code", "Unit of Measure", "Size (gross)")
-    if t:
-        for row in t.find_all("tr"):
-            cells = row.find_all("td")
-            if len(cells) == 2:
-                lbl, val = cells[0].text.strip(), cells[1].text.strip()
-                if lbl in ("Use Code", "Unit of Measure", "Size (gross)"):
-                    data[lbl] = val
-
-    # --- Owners & Taxpayers ---
-    t = _find_table(tables, "Role", "Percent", "Name", "Address")
-    if t:
-        owners, taxpayers = [], []
-        for row in t.find_all("tr")[1:]:
-            cells = row.find_all("td")
-            if len(cells) >= 4:
-                role = cells[0].text.strip()
-                name, addr = cells[2].text.strip(), cells[3].text.strip()
-                if role == "Owner":
-                    owners.append((name, addr))
-                elif role == "Taxpayer":
-                    taxpayers.append((name, addr))
-        if owners:
-            data.update(split_owner_names(owners[0][0]))
-            data["Owner Address"] = owners[0][1]
-        else:
-            data.update(split_owner_names(""))
-            data["Owner Address"] = ""
-        data["Taxpayer Name"] = taxpayers[0][0] if taxpayers else ""
-        data["Tax Address"]   = taxpayers[0][1] if taxpayers else ""
-
-    # --- Property Values ---
-    t = _find_table(tables, "Value Type", "Tax Year", "Taxable Value Regular")
-    if t:
-        rows = t.find_all("tr")
-        if rows:
-            for hc in rows[0].find_all("td")[1:]:
-                m = re.search(r'(\d{4})', hc.text)
-                if m:
-                    data["Latest Tax Year"] = m.group(1)
-                    break
-            for row in rows[1:]:
-                cells = row.find_all("td")
-                if len(cells) >= 2:
-                    lbl, val = cells[0].text.strip(), cells[1].text.strip()
-                    if lbl in ("Taxable Value Regular", "Market Total",
-                               "Assessed Value", "Market Land", "Market Improvement"):
-                        data[lbl] = val
-
-    # --- Annual Tax ---
-    t = _find_table(tables, "Tax Year", "Installment", "Due Date", "Principal")
-    if t:
-        total = 0
-        for row in t.find_all("tr")[1:]:
-            for c in row.find_all("td"):
-                ct = c.text.strip()
-                if ct.startswith("$"):
-                    try:
-                        total += float(ct.replace("$", "").replace(",", ""))
-                        break
-                    except ValueError:
-                        pass
-        data["Annual Tax Amount"] = f"${total:,.2f}" if total > 0 else ""
-
-    # --- Structure Info Link ---
-    struct_link = ""
-    t = _find_table(tables, "Description", "Type", "Year Built", "More Information")
-    if t:
-        for row in t.find_all("tr")[1:]:
-            cells = row.find_all("td")
-            if len(cells) >= 3:
-                data["Structure Description"] = cells[0].text.strip()
-                data["Structure Type"]        = cells[1].text.strip()
-                data["Year Built"]            = cells[2].text.strip()
-                if len(cells) >= 4:
-                    a = cells[3].find("a")
-                    if a and a.get("href"):
-                        h = a["href"]
-                        struct_link = h if h.startswith("http") else urljoin(url, h)
-                break
-
-    # --- Sales History ---
-    sales = []
-    t = _find_table(tables, "Sale Date", "Sale Amount", "Grantor")
-    if t:
-        for row in t.find_all("tr")[1:]:
-            cells = row.find_all("td")
-            if len(cells) >= 8:
-                sales.append({
-                    "date": cells[0].text.strip(),
-                    "amount": cells[3].text.strip(),
-                    "deed": cells[5].text.strip(),
-                    "grantor": cells[7].text.strip(),
-                    "grantee": cells[8].text.strip() if len(cells) > 8 else "",
-                })
-    data["Most Recent Sale Date"] = ""
-    data["Most Recent Sale Amount"] = ""
-    for s in reversed(sales):
-        try:
-            if float(s["amount"].replace("$", "").replace(",", "").strip()) > 0:
-                data["Most Recent Sale Date"]   = s["date"]
-                data["Most Recent Sale Amount"] = s["amount"]
-                break
-        except ValueError:
-            continue
-    data["Sales History"] = "; ".join(
-        f"{s['date']} - {s['amount']} ({s['deed']}) {s['grantor']} -> {s['grantee']}"
-        for s in sales) if sales else ""
-
-    # --- Neighborhood Code ---
-    t = _find_table(tables, "Neighborhood Code", "Township", "Range")
-    if t:
-        for row in t.find_all("tr")[1:]:
-            cells = row.find_all("td")
-            if cells:
-                data["Neighborhood Code"] = cells[0].text.strip()
-                break
-
-    return data, struct_link
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  STRUCTURE PAGE PARSING (Snohomish County)
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def parse_structure_page(session, struct_url):
-    """Fetch and parse the structure detail page for beds, baths, sqft, etc."""
-    if not struct_url:
-        return {}
-    try:
-        resp = session.get(struct_url, timeout=15)
-        resp.raise_for_status()
-    except Exception as e:
-        print(f"  [WARNING] Could not fetch structure page: {e}")
-        return {}
-
-    soup = BeautifulSoup(resp.text, "html.parser")
-
-    def field(label):
-        for td in soup.find_all("td"):
-            if td.text.strip() == label:
-                nxt = td.find_next_sibling("td")
-                return nxt.text.strip() if nxt else ""
-        return ""
-
-    d = {
-        "Bedrooms": field("Bedrooms"),
-        "Full or 3/4 Baths": field("Full or 3/4 Baths"),
-        "Half Baths": "",
-        "Heat": field("Heat"),
-        "Fireplace": field("Fireplace"),
-        "Foundation": field("Foundation"),
-        "Exterior": field("Exterior"),
-        "Roof Type": field("ROOF\u00a0\u00a0Type:"),
-        "Garage SF": field("Attached Garage SF"),
-    }
-
-    for td in soup.find_all("td"):
-        if td.text.strip() == "1/2 Baths":
-            nxt = td.find_next_sibling("td")
-            if nxt:
-                d["Half Baths"] = nxt.text.strip()
-            break
-
-    # Floor areas
-    total_sf, details = 0, []
-    all_tds = soup.find_all("td")
-    for i, td in enumerate(all_tds):
-        if td.text.strip() == "Floor":
-            ahead = [t.text.strip() for t in all_tds[i+1:i+7]]
-            floor_num = ahead[0] if ahead else ""
-            finished = ""
-            for j, txt in enumerate(ahead):
-                if txt == "Finished SF" and j+1 < len(ahead):
-                    finished = ahead[j+1]
-                    break
-            if floor_num and finished:
-                details.append(f"Floor {floor_num}: {finished} SF")
-                try:
-                    total_sf += int(finished)
-                except ValueError:
-                    pass
-    d["Total Finished SF"] = str(total_sf) if total_sf > 0 else ""
-    d["Floor Details"] = "; ".join(details) if details else ""
-
-    # Assessor photo URL
-    d["_assessor_photo_url"] = ""
-    for img in soup.find_all("img"):
-        src = img.get("src", "")
-        if "photos" in src and ".jpg" in src.lower():
-            d["_assessor_photo_url"] = src
-            break
-
-    return d
+# (The new scrape_property() that calls the portal API lives further down, next
+#  to the King County live lookup and the shared photo/owner helpers it reuses.)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1753,183 +1511,130 @@ def _street_signature(addr):
     return number, street_words
 
 
-def _filter_wildcard_results(results, input_address, city=None):
-    """Bug 2 fix. Given wildcard search results and the original input
-    address, return only the results whose street actually matches the
-    input street. Prevents the scraper from silently grabbing the wrong
-    property (e.g. '212 Ave C' matching '212 86TH AVE SE').
+_SNOHO_DIRS = {"N", "S", "E", "W", "NE", "NW", "SE", "SW"}
+_SNOHO_TYPES = {"ST", "AVE", "DR", "RD", "LN", "CT", "PL", "BLVD", "CIR", "TER",
+                "PKWY", "HWY", "WY", "WAY", "CV", "LOOP", "RUN", "PT", "TRL"}
 
-    A result matches when the house number is identical AND the result's
-    street words are a subset/superset overlap of the input's street words
-    (every input street word appears in the result, allowing for the
-    assessor's fuller formatting).
 
-    When `city` is given and the street matches in more than one city (e.g.
-    '703 10th St' exists in both Snohomish and Mukilteo), the result in the
-    input city is preferred - the street signature alone can't tell them apart.
+def _snoho_keyword(cleaned_street):
+    """The portal matches best on house number + street NAME (it explicitly
+    advises dropping street types and directions). Build that keyword from the
+    cleaned street, e.g. '55065 E Sauk Ln' -> '55065 Sauk'."""
+    parts = cleaned_street.split()
+    if not parts:
+        return cleaned_street
+    hn = parts[0]
+    core = [w for w in parts[1:]
+            if w.upper() not in _SNOHO_DIRS and w.upper() not in _SNOHO_TYPES]
+    return (hn + " " + " ".join(core)).strip() if core else cleaned_street
 
-    If the input has no parseable house number and street (e.g. a truncated
-    lead like '19815'), nothing matches and the caller skips the address.
-    """
-    in_num, in_words = _street_signature(input_address)
-    if in_num is None or not in_words:
-        # Truncated or unparseable input: refuse to guess.
-        return []
-    matched = []
-    for r in results:
-        if r[0] == "DIRECT":
-            matched.append(r)
-            continue
-        # parse_search_results tuple: (parcel, addr, url)
-        result_addr = r[1] if len(r) > 1 else ""
-        res_num, res_words = _street_signature(result_addr)
-        if res_num is None:
-            continue
-        if res_num != in_num:
-            continue
-        # Every input street word must appear in the result's street words.
-        if in_words.issubset(res_words):
-            matched.append(r)
-    # Disambiguate by city when the same street matches in several cities (e.g.
-    # '703 10th St' in both Snohomish and Mukilteo). A DIRECT hit is authoritative
-    # and always kept. Otherwise, when several parcels share the street, prefer the
-    # one in the input city; if none carries that city, refuse to guess (return [])
-    # rather than grab a wrong-city parcel. A single match is left as-is, since the
-    # lead's postal city often differs from the assessor's (e.g. Snohomish vs Monroe).
-    if any(r[0] == "DIRECT" for r in matched):
-        return matched
-    if city and len(matched) > 1:
-        c = city.lower().strip()
-        return [r for r in matched if c and c in (r[1] or "").lower()]
-    return matched
+
+def _snoho_pick(items, cleaned_street, lead_city):
+    """Choose the result matching the input street, disambiguating by city when
+    several streets match. Street match = same house number and the input's
+    street words are a subset of the result's (so a missing directional suffix
+    like 'SE' still matches). Returns the chosen fields dict, or None when the
+    match is absent or ambiguous - never guess a wrong parcel."""
+    in_num, in_words = _street_signature(cleaned_street)
+
+    def matches(f):
+        n, w = _street_signature(f.get("Situs", ""))
+        return in_num is not None and n == in_num and in_words and in_words.issubset(w)
+
+    pool = [f for f in items if matches(f)] if in_num else []
+    pool = pool or items
+    if len(pool) == 1:
+        return pool[0]
+    if lead_city:
+        city_matches = [f for f in pool
+                        if (f.get("Situscity", "") or "").upper() == lead_city.upper()]
+        if len(city_matches) == 1:
+            return city_matches[0]
+    return None
+
+
+def _snoho_build(fields, raw_address):
+    """Map a QuickSearch result to the master schema. The public search result
+    carries parcel + owner + situs; rich assessor detail (value/beds/baths/year)
+    is not exposed by this API, so those stay blank (like a structure-less parcel)."""
+    data = {}
+    data["Parcel Number"] = (fields.get("ParcelID", "") or "").strip()
+    data.update(split_owner_names(fields.get("LPRDisplayName", "") or ""))
+    data["Taxpayer Name"] = (fields.get("Taxpayers", "") or "").strip()
+
+    situs = smart_title_case((fields.get("Situs", "") or "").strip())
+    city = smart_title_case((fields.get("Situscity", "") or "").strip())
+    # Zip from the END of the raw lead address (the portal result has no zip
+    # field). Anchored to the tail so it can't grab a 5-digit house number.
+    zm = re.search(r"(\d{5})(?:-\d{4})?\s*$", (raw_address or "").strip())
+    zc = zm.group(1) if zm else ""
+    data["Property Street"] = situs
+    data["Property City"] = city
+    data["Property State"] = "WA"
+    data["Property Zip"] = zc
+    if city:
+        tail = f"{city} WA {zc}".strip()
+    elif zc:
+        tail = f"WA {zc}"
+    else:
+        tail = ""
+    data["Property Address"] = ", ".join(p for p in (situs, tail) if p)
+    return data
 
 
 def scrape_property(session, address, base_resp, api_key=None, photo_folder="property_photos"):
-    """Search for an address, parse the parcel page, download photos.
-    Returns a data dict or None on failure.
+    """Look up an address in the Snohomish County Public Access portal (QuickSearch
+    JSON API) and return a data dict in the master schema, or None.
 
-    As of v2.4.0 this receives the RAW address (with city/state/zip). It
-    cleans the address itself, the same way lookup_property_kc() does. This
-    keeps county routing (detect_county, which needs the city) separate from
-    the assessor search (which needs the city stripped)."""
-    search_address_str = clean_address_for_search(address)
-    search_city = _extract_city_segment(address)
+    `base_resp` is the auth ctx dict from get_session(). v2.8.0 replaced the
+    retired snoco.org/proptax WebForms scrape. The search result carries parcel +
+    owner + situs (enough for ownership verification); rich assessor detail is not
+    in the public API and is left blank. Receives the RAW address (with city/zip)
+    and cleans it itself, the same split as the King County path."""
+    cleaned = clean_address_for_search(address)
+    lead_city = _extract_city_segment(address)
+    keyword = _snoho_keyword(cleaned)
 
     print(f"\n{'='*60}")
-    print(f"  Searching: {search_address_str}")
+    print(f"  Searching (Snohomish live): {cleaned}")
     print(f"{'='*60}")
 
-    # --- Search ---
     try:
-        results_resp = search_address(session, search_address_str, base_resp)
+        r = session.get(SNOHO_GETDATA, params={"keywords": keyword, "page": "1"},
+                        headers=base_resp, timeout=25)
+        r.raise_for_status()
+        items = [it.get("fields", {}) for it in r.json().get("items", [])]
     except Exception as e:
-        print(f"  [ERROR] Search failed: {e}")
+        print(f"  [ERROR] Snohomish search failed: {e}")
         return None
 
-    results = parse_search_results(results_resp)
-
-    # Bug fix: filter the INITIAL results by street too (not just the wildcard
-    # retry). The assessor search can return several loosely-matched parcels; the
-    # old code took results[0] blindly, which grabbed a wrong-street property
-    # (e.g. '13333 Wagner Rd' -> '13333 11th Ave W'). DIRECT hits pass through; if
-    # nothing matches the input street, fall through to the wildcard retry / a
-    # clean skip rather than enriching the wrong parcel.
-    if results and results[0][0] != "DIRECT":
-        filtered = _filter_wildcard_results(results, search_address_str, city=search_city)
-        results = filtered if filtered else []
-
-    # Wildcard retry if no results
-    if not results:
-        m = re.match(r'^(\d+)\s+(.+)$', search_address_str)
-        if m:
-            wildcard = f"{m.group(1)}%{m.group(2).split()[0]}"
-            print(f"  -> No exact match, retrying with wildcard: {wildcard}")
-            try:
-                s2, b2 = get_session()
-                results_resp = search_address(s2, wildcard, b2)
-                wild_results = parse_search_results(results_resp)
-                if wild_results and wild_results[0][0] != "DIRECT":
-                    # Bug 2 fix: do NOT blindly take the first wildcard result.
-                    # Require the result's street name to match the input
-                    # street name, or skip rather than guess a wrong property.
-                    results = _filter_wildcard_results(wild_results, search_address_str, city=search_city)
-                    if results:
-                        session = s2
-                    else:
-                        print(f"  [ERROR] Wildcard retry returned "
-                              f"{len(wild_results)} result(s), none matching the "
-                              f"input street. Skipping rather than guessing.")
-                elif wild_results and wild_results[0][0] == "DIRECT":
-                    results = wild_results
-                    session = s2
-            except Exception:
-                pass
-
-    if not results:
-        print(f"  [ERROR] No results found for: {search_address_str}")
+    if not items:
+        print(f"  [ERROR] No Snohomish parcel found for: {cleaned}")
         return None
 
-    # --- Fetch parcel page ---
-    if results[0][0] == "DIRECT":
-        parcel_html = results[0][1].text
-        parcel_url  = results[0][1].url
-    else:
-        parcel_num, parcel_addr, parcel_href = results[0]
-        print(f"  -> Found: {parcel_num} | {parcel_addr}")
-        if len(results) > 1:
-            print(f"  -> ({len(results)} total results, using first match)")
-        try:
-            r = session.get(parcel_href, timeout=15)
-            r.raise_for_status()
-            parcel_html, parcel_url = r.text, r.url
-        except Exception as e:
-            print(f"  [ERROR] Could not fetch parcel page: {e}")
-            return None
+    chosen = _snoho_pick(items, cleaned, lead_city)
+    if not chosen:
+        cities = ", ".join(sorted({(i.get("Situscity", "") or "").strip() for i in items}))
+        print(f"  [ERROR] {len(items)} Snohomish result(s), none unambiguously matched "
+              f"'{cleaned}' (results in: {cities}). Skipping rather than guessing.")
+        return None
 
-    # --- Parse parcel page ---
-    data, struct_link = parse_parcel_page(parcel_html, parcel_url)
+    data = _snoho_build(chosen, address)
+    print(f"  -> Parcel: {data.get('Parcel Number')}")
+    print(f"  -> Owner:  {data.get('Owner 1 First Name','')} {data.get('Owner 1 Last Name','')}")
+    print(f"  -> Situs:  {data.get('Property Address')}")
 
-    print(f"  -> Parcel: {data.get('Parcel Number', 'N/A')}")
-    print(f"  -> Owner: {data.get('Owner 1 First Name', '')} {data.get('Owner 1 Last Name', '')}")
-    print(f"  -> Assessed: {data.get('Assessed Value', 'N/A')}")
-    print(f"  -> Year Built: {data.get('Year Built', 'N/A')}")
-    print(f"  -> Last Sale: {data.get('Most Recent Sale Date', 'N/A')} for {data.get('Most Recent Sale Amount', 'N/A')}")
-    print(f"  -> Annual Tax: {data.get('Annual Tax Amount', 'N/A')}")
-    print(f"  -> Neighborhood: {data.get('Neighborhood Code', 'N/A')}")
-
-    # --- Structure details ---
-    if struct_link:
-        print(f"  -> Fetching structure details...")
-        struct = parse_structure_page(session, struct_link)
-        assessor_url = struct.pop("_assessor_photo_url", "")
-        data.update(struct)
-        print(f"  -> Beds: {struct.get('Bedrooms', 'N/A')} | Baths: {struct.get('Full or 3/4 Baths', 'N/A')} | SF: {struct.get('Total Finished SF', 'N/A')}")
-
-        if assessor_url:
-            print(f"  -> Downloading assessor photo...")
-            ap = download_assessor_photo(assessor_url, data.get("Property Address", ""),
-                                          data.get("Owner 1 Last Name", ""), photo_folder)
-            data["Assessor Photo File"] = ap
-            if ap:
-                print(f"  -> Assessor photo saved: {ap}")
-    else:
-        print(f"  -> No structure detail link found")
-
-    # --- Street View photo ---
+    # Street View photo (Google), same as the King County path.
     if api_key and data.get("Property Address"):
-        print(f"  -> Downloading Street View photo...")
         sv = download_street_view(data["Property Address"],
-                                   data.get("Owner 1 Last Name", ""),
-                                   api_key, photo_folder)
+                                  data.get("Owner 1 Last Name", ""),
+                                  api_key, photo_folder)
         data["Photo File"] = sv
         if sv:
             print(f"  -> Street View photo saved: {sv}")
-        else:
-            print(f"  -> No Street View image available")
     else:
         data["Photo File"] = ""
 
-    # --- Title case ---
     data = apply_title_case(data)
     data["County"] = "Snohomish"
     return data
@@ -2201,7 +1906,7 @@ def main():
         sys.exit(1)
 
     # --- Setup ---
-    print(f"\nProperty Tax Scraper v2.7.4 (Snohomish web + King County LIVE)")
+    print(f"\nProperty Tax Scraper v2.8.0 (Snohomish web + King County LIVE)")
     print(f"{'='*50}")
     print(f"Properties to look up: {len(lookups)}")
 
@@ -2219,10 +1924,11 @@ def main():
     if any(is_split_city(addr) for addr, _ in lookups):
         counties_needed.update({"snohomish", "king"})
 
-    # Snohomish: live web scrape (only connect if a Snohomish address is present)
+    # Snohomish: live JSON API on the Public Access portal (only connect if a
+    # Snohomish address is present). base_resp here is the auth-context dict.
     session, base_resp = None, None
     if "snohomish" in counties_needed:
-        print("\nConnecting to snoco.org...")
+        print("\nConnecting to the Snohomish County Public Access portal...")
         try:
             session, base_resp = get_session()
             print("Connected!")

@@ -28,7 +28,7 @@ enrichment (you can still add them as contacts via the dashboard Add form).
 import os
 from datetime import datetime
 
-import snoco_scraper_v2_7_4 as scraper
+import snoco_scraper_v2_8_0 as scraper
 import propintel_db_v0_1_0 as pdb  # noqa: F401  (save_to_database uses it)
 import propintel_backup_v0_1_0 as backup
 
