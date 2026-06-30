@@ -16,7 +16,7 @@ the connection; reenrich() commits its own change.
 import os
 
 import propintel_db_v0_1_0 as pdb
-import snoco_scraper_v2_8_3 as scraper
+import snoco_scraper_v2_8_4 as scraper
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 

@@ -1,8 +1,17 @@
 """
-Property Tax Record Scraper  v2.8.3
+Property Tax Record Scraper  v2.8.4
 ====================================
 Automated property data extraction for Snohomish County AND King County.
 County is auto-detected from the address city name.
+
+v2.8.4 Changes (Snohomish search recovers tricky address formats):
+    - The keyword (house# + name, types/directions dropped) over-stripped some
+      addresses to nothing useful. scrape_property() now falls back to the full
+      spelled-out street when the stripped keyword finds nothing, recovering
+      lettered avenues ('Avenue D'), name-as-direction streets ('S Machias Rd'),
+      and named loops ('Mountain Loop Hwy'). Unit/space designators (#1, SP 2,
+      Unit B) are stripped from both. Normal addresses are unaffected (the first
+      keyword still resolves them).
 
 v2.8.3 Changes (Snohomish "most recent sale" = most recent real sale):
     - "Most Recent Sale Date/Amount" now uses the newest NON-ZERO sale instead of
@@ -1554,17 +1563,35 @@ _SNOHO_TYPES = {"ST", "AVE", "DR", "RD", "LN", "CT", "PL", "BLVD", "CIR", "TER",
                 "PKWY", "HWY", "WY", "WAY", "CV", "LOOP", "RUN", "PT", "TRL"}
 
 
+def _strip_unit(street):
+    """Drop a trailing unit/space designator (#1, SP 2, UNIT B, APT 3) from a
+    street so it doesn't poison the portal search."""
+    s = re.sub(r"\s+(#|UNIT|APT|STE|SUITE|SP|SPACE|LOT)\s*#?\s*\S*$", "", street, flags=re.I)
+    return re.sub(r"\s+#\S*$", "", s).strip()
+
+
 def _snoho_keyword(cleaned_street):
-    """The portal matches best on house number + street NAME (it explicitly
-    advises dropping street types and directions). Build that keyword from the
-    cleaned street, e.g. '55065 E Sauk Ln' -> '55065 Sauk'."""
-    parts = cleaned_street.split()
+    """The portal matches best on house number + street NAME (it advises dropping
+    street types and directions). Build that keyword from the cleaned street, e.g.
+    '55065 E Sauk Ln' -> '55065 Sauk'. Unit designators are stripped."""
+    parts = _strip_unit(cleaned_street).split()
     if not parts:
         return cleaned_street
     hn = parts[0]
     core = [w for w in parts[1:]
             if w.upper() not in _SNOHO_DIRS and w.upper() not in _SNOHO_TYPES]
     return (hn + " " + " ".join(core)).strip() if core else cleaned_street
+
+
+def _snoho_raw_street(address):
+    """The street exactly as the lead wrote it (before abbreviation), minus any
+    city/state/zip tail and unit designator. Used as a fallback keyword: dropping
+    types/directions over-strips lettered avenues ('Avenue D'), name-as-direction
+    streets ('S Machias'), and named loops ('Mountain Loop'); the full spelled-out
+    street matches those, and the portal's spell-it-out advice prefers it."""
+    s = (address or "").split(",")[0].strip()
+    s = re.sub(r"\s+\d{5}(-\d{4})?$", "", s).strip()
+    return _strip_unit(s)
 
 
 def _snoho_pick(items, cleaned_street, lead_city):
@@ -1803,17 +1830,31 @@ def scrape_property(session, address, base_resp, api_key=None, photo_folder="pro
     city/zip) and cleans it itself, the same split as the King County path."""
     cleaned = clean_address_for_search(address)
     lead_city = _extract_city_segment(address)
-    keyword = _snoho_keyword(cleaned)
 
     print(f"\n{'='*60}")
     print(f"  Searching (Snohomish live): {cleaned}")
     print(f"{'='*60}")
 
+    # Try the stripped keyword (best for most addresses); if it finds nothing,
+    # fall back to the full spelled-out street (recovers lettered avenues like
+    # 'Avenue D', name-as-direction streets like 'S Machias', and named loops that
+    # the type/direction stripping over-trims). De-dup candidates.
+    candidates, seen = [], set()
+    for kw in (_snoho_keyword(cleaned), _snoho_raw_street(address)):
+        kw = (kw or "").strip()
+        if kw and kw.upper() not in seen:
+            seen.add(kw.upper())
+            candidates.append(kw)
+
+    items = []
     try:
-        r = session.get(SNOHO_GETDATA, params={"keywords": keyword, "page": "1"},
-                        headers=base_resp, timeout=25)
-        r.raise_for_status()
-        items = [it.get("fields", {}) for it in r.json().get("items", [])]
+        for kw in candidates:
+            r = session.get(SNOHO_GETDATA, params={"keywords": kw, "page": "1"},
+                            headers=base_resp, timeout=25)
+            r.raise_for_status()
+            items = [it.get("fields", {}) for it in r.json().get("items", [])]
+            if items:
+                break
     except Exception as e:
         print(f"  [ERROR] Snohomish search failed: {e}")
         return None
@@ -2130,7 +2171,7 @@ def main():
         sys.exit(1)
 
     # --- Setup ---
-    print(f"\nProperty Tax Scraper v2.8.3 (Snohomish web + King County LIVE)")
+    print(f"\nProperty Tax Scraper v2.8.4 (Snohomish web + King County LIVE)")
     print(f"{'='*50}")
     print(f"Properties to look up: {len(lookups)}")
 
