@@ -1,8 +1,19 @@
 """
-Property Tax Record Scraper  v2.8.1
+Property Tax Record Scraper  v2.8.2
 ====================================
 Automated property data extraction for Snohomish County AND King County.
 County is auto-detected from the address city name.
+
+v2.8.2 Changes (Snohomish building detail: beds / baths / sqft / construction):
+    - Snohomish now also pulls the structure detail that lives one click deeper,
+      on each parcel's Building Detail page (linked from the summary's Buildings
+      table). snoho_fetch_detail() follows that link (carried in the DataDisplay
+      row's hyperlink) and reads bedrooms, full + half baths, finished sqft,
+      grade/quality, condition, floors, exterior, roof, foundation, heat, and
+      fireplace from the building page's DataDisplay tables. This closes the last
+      gap: Snohomish now returns MORE structure detail than King County.
+    - _dd_rows() refactored to take a generic context-param dict ({p,a,m} for the
+      summary, {b,a,p,d} for a building page) and to surface cell hyperlinks.
 
 v2.8.1 Changes (Snohomish rich detail restored):
     - Snohomish leads now get assessed value, market total, last sale date + price,
@@ -1601,17 +1612,19 @@ def _snoho_build(fields, raw_address):
     return data
 
 
-def _dd_rows(session, headers, module_id, p, a, m, summ_url):
-    """Fetch one DataDisplay table (by its ModuleId) from the parcel summary page
-    and return (column_set, list_of_row_dicts)."""
+def _dd_rows(session, headers, module_id, ctx_params, referer):
+    """Fetch one DataDisplay table (by its ModuleId) and return (column_set,
+    list_of_row_dicts). ctx_params carries the page context the table needs:
+    {p,a,m} for the Property Account Summary page, {b,a,p,d} for a Building Detail
+    page. Each row dict also includes '<column>__link' for any cell that carries a
+    hyperlink (used to follow the Buildings table to per-building detail)."""
     try:
         r = session.get(SNOHO_DD_GETDATA, headers={
-            **headers, "ModuleId": str(module_id), "Referer": summ_url,
+            **headers, "ModuleId": str(module_id), "Referer": referer,
             # Force JSON: the shared session Accept lists application/xml first,
             # which makes this endpoint try (and fail) to serialize to XML (500).
             "Accept": "application/json"},
-            params={"p": p, "a": a, "m": m, "itemsPerPage": "50", "page": "1"},
-            timeout=20)
+            params={**ctx_params, "itemsPerPage": "50", "page": "1"}, timeout=20)
         r.raise_for_status()
         j = r.json()
     except Exception:
@@ -1619,18 +1632,89 @@ def _dd_rows(session, headers, module_id, p, a, m, summ_url):
     rows = []
     for g in j.get("groups", []):
         for row in g.get("rows", []):
-            rows.append({c.get("column"): c.get("value") for c in row.get("values", [])})
+            d = {}
+            for c in row.get("values", []):
+                col = c.get("column")
+                d[col] = c.get("value")
+                if c.get("hyperlink"):
+                    d[col + "__link"] = c["hyperlink"]
+            rows.append(d)
     cols = {h.get("column") for h in j.get("headers", [])}
     return cols, rows
 
 
+def _snoho_building_detail(session, link):
+    """Follow a Buildings-table link to one building's detail page and return its
+    structure facts: bedrooms, full/half baths, finished sqft, grade, condition,
+    floors, exterior, roof, foundation, heat, fireplace. The page hosts DataDisplay
+    tables identified by column name. Best-effort; never raises."""
+    from urllib.parse import urlparse, parse_qs
+    out = {}
+    if not link:
+        return out
+    url = link if link.startswith("http") else SNOHO_BASE + link
+    try:
+        html = session.get(url, timeout=25).text
+    except Exception:
+        return out
+    rvt = re.search(r'name="__RequestVerificationToken"[^>]*value="([^"]+)"', html)
+    tab = re.search(r"sf_tabId[^0-9]{0,4}(\d+)", html)
+    if not rvt or not tab:
+        return out
+    hdrs = {"TabId": tab.group(1), "RequestVerificationToken": rvt.group(1)}
+    q = {k: v[0] for k, v in parse_qs(urlparse(url).query).items()}
+    ctx = {k: q[k] for k in ("b", "a", "p", "d") if k in q}
+    module_ids = re.findall(r'<data-display-root moduleId="(\d+)"', html)
+
+    for mid in module_ids:
+        cols, rows = _dd_rows(session, hdrs, mid, ctx, url)
+        if not rows:
+            continue
+        # Characteristics table: Description/Units rows.
+        if "Description" in cols and "Units" in cols:
+            chars = {(r.get("Description") or "").strip().lower(): (r.get("Units") or "").strip()
+                     for r in rows}
+            if chars.get("bedroom count"):
+                out["Bedrooms"] = chars["bedroom count"]
+            if chars.get("full baths"):
+                out["Full or 3/4 Baths"] = chars["full baths"]
+            if chars.get("half baths"):
+                out["Half Baths"] = chars["half baths"]
+            fp = next((v for k, v in chars.items() if k.startswith("fireplace") and v), "")
+            if fp:
+                out["Fireplace"] = fp
+        # Improvement summary: the main dwelling row carries finished area + quality.
+        elif "FinishedArea" in cols:
+            main = next((r for r in rows if any(t in (r.get("ImprovementModelDescr") or "").lower()
+                        for t in ("detached", "single family"))), rows[0])
+            for key, col in [("Total Finished SF", "FinishedArea"),
+                             ("Property Grade", "QualityDescr"),
+                             ("Property Condition", "ConditionDescr"),
+                             ("Floor Details", "FloorDescr")]:
+                v = (main.get(col) or "").strip()
+                if key == "Total Finished SF":
+                    v = re.sub(r"\.00$", "", v)  # 1855.00 -> 1855
+                if v and v != "-":
+                    out[key] = v
+        # Construction elements: Foundation / Exterior / Roof / Heating by category.
+        elif "ElementCategoryDescr" in cols:
+            elems = {(r.get("ElementCategoryDescr") or "").strip().lower():
+                     (r.get("ElementCodeDescr") or "").strip() for r in rows}
+            for ecat, key in {"foundation wall": "Foundation", "ext wall cover": "Exterior",
+                              "roof type": "Roof Type", "heating": "Heat"}.items():
+                if elems.get(ecat):
+                    out[key] = elems[ecat]
+    return out
+
+
 def snoho_fetch_detail(session, address_ctx, parcel, altkey, mapkey):
-    """Pull rich assessor detail (assessed value, market total, last sale date +
-    price, sales history, year built) for a Snohomish parcel from its Property
-    Account Summary page. Returns a master-schema dict (possibly partial); never
-    raises. The summary page hosts each fact as a DataDisplay JSON table, which we
-    identify by column name. (Beds/baths/finished sqft are not published on this
-    portal, so they remain blank.)"""
+    """Pull rich assessor detail for a Snohomish parcel from its Property Account
+    Summary page (and the linked Building Detail page). Returns a master-schema
+    dict (possibly partial); never raises. The pages host each fact as a
+    DataDisplay JSON table identified by column name: assessed value / market
+    total / taxable, last sale date + price + sales history, year built, and (from
+    the building link) bedrooms, full/half baths, finished sqft, grade, condition,
+    exterior, roof, foundation, heat, fireplace."""
     out = {}
     summ = f"{SNOHO_SUMMARY_PAGE}?p={parcel}&a={altkey}&m={mapkey}"
     try:
@@ -1643,10 +1727,11 @@ def snoho_fetch_detail(session, address_ctx, parcel, altkey, mapkey):
     if not rvt or not tab:
         return out
     hdrs = {"TabId": tab.group(1), "RequestVerificationToken": rvt.group(1)}
+    ctx = {"p": parcel, "a": altkey, "m": mapkey}
     module_ids = re.findall(r'<data-display-root moduleId="(\d+)"', html)
 
     for mid in module_ids:
-        cols, rows = _dd_rows(session, hdrs, mid, parcel, altkey, mapkey, summ)
+        cols, rows = _dd_rows(session, hdrs, mid, ctx, summ)
         if not rows:
             continue
         # Value history: rows keyed by ValueDescription; the first value column
@@ -1679,11 +1764,17 @@ def snoho_fetch_detail(session, address_ctx, parcel, altkey, mapkey):
                 out["Most Recent Sale Amount"] = (top.get("AdjustedSalesPrice") or "").strip()
             if hist:
                 out["Sales History"] = " | ".join(hist)
-        # Year built.
+        # Year built + the Buildings table's link to per-building detail
+        # (bedrooms, baths, finished sqft, construction).
         elif "YearBuilt" in cols:
             yb = next((r.get("YearBuilt") for r in rows if (r.get("YearBuilt") or "").strip()), "")
             if yb:
                 out["Year Built"] = str(yb).strip()
+            if "BuildingName" in cols:
+                link = next((r.get("BuildingName__link") for r in rows
+                             if r.get("BuildingName__link")), "")
+                if link:
+                    out.update(_snoho_building_detail(session, link))
     return out
 
 
@@ -2026,7 +2117,7 @@ def main():
         sys.exit(1)
 
     # --- Setup ---
-    print(f"\nProperty Tax Scraper v2.8.1 (Snohomish web + King County LIVE)")
+    print(f"\nProperty Tax Scraper v2.8.2 (Snohomish web + King County LIVE)")
     print(f"{'='*50}")
     print(f"Properties to look up: {len(lookups)}")
 
