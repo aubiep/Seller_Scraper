@@ -1,8 +1,16 @@
 """
-Property Tax Record Scraper  v2.8.2
+Property Tax Record Scraper  v2.8.3
 ====================================
 Automated property data extraction for Snohomish County AND King County.
 County is auto-detected from the address city name.
+
+v2.8.3 Changes (Snohomish "most recent sale" = most recent real sale):
+    - "Most Recent Sale Date/Amount" now uses the newest NON-ZERO sale instead of
+      the literal top transfer row. The top row is often a $0 quit-claim or intra-
+      family transfer; the real arms-length sale (which the equity score needs)
+      sits below it. Fixes leads that showed sale=$0 despite a real prior sale
+      (e.g. a parcel that actually sold for $255,000). Full Sales History string
+      is unchanged. King County path unaffected.
 
 v2.8.2 Changes (Snohomish building detail: beds / baths / sqft / construction):
     - Snohomish now also pulls the structure detail that lives one click deeper,
@@ -1749,7 +1757,10 @@ def snoho_fetch_detail(session, address_ctx, parcel, altkey, mapkey):
                     out["Market Total"] = amt.lstrip("$")
                 elif desc == "taxable value regular":
                     out["Taxable Value Regular"] = amt.lstrip("$")
-        # Sale / transfer history: most recent row first.
+        # Sale / transfer history (rows are newest-first). For "Most Recent Sale"
+        # prefer the newest row with a NON-ZERO price: the top row is often a $0
+        # quit-claim / intra-family transfer, while the real arms-length sale (the
+        # one the equity calc needs) sits below it.
         elif "SaleDate" in cols:
             hist = []
             for row in rows:
@@ -1758,10 +1769,12 @@ def snoho_fetch_detail(session, address_ctx, parcel, altkey, mapkey):
                 form = (row.get("DocSubType") or row.get("ConveyanceForm") or "").strip()
                 if d:
                     hist.append(f"{d}: ${price} ({form})" if price else f"{d}: {form}")
-            if rows:
-                top = rows[0]
-                out["Most Recent Sale Date"] = (top.get("SaleDate") or "").split(" ")[0].strip()
-                out["Most Recent Sale Amount"] = (top.get("AdjustedSalesPrice") or "").strip()
+            real = next((r for r in rows
+                         if (r.get("AdjustedSalesPrice") or "").strip() not in ("", "0")), None)
+            chosen = real or (rows[0] if rows else None)
+            if chosen:
+                out["Most Recent Sale Date"] = (chosen.get("SaleDate") or "").split(" ")[0].strip()
+                out["Most Recent Sale Amount"] = (chosen.get("AdjustedSalesPrice") or "").strip()
             if hist:
                 out["Sales History"] = " | ".join(hist)
         # Year built + the Buildings table's link to per-building detail
@@ -2117,7 +2130,7 @@ def main():
         sys.exit(1)
 
     # --- Setup ---
-    print(f"\nProperty Tax Scraper v2.8.2 (Snohomish web + King County LIVE)")
+    print(f"\nProperty Tax Scraper v2.8.3 (Snohomish web + King County LIVE)")
     print(f"{'='*50}")
     print(f"Properties to look up: {len(lookups)}")
 
