@@ -39,6 +39,18 @@ def load_buttons():
         return json.load(f)["buttons"]
 
 
+def load_config():
+    """The whole iauto_templates.json (buttons + _about/_field_notes)."""
+    with open(BUTTONS_CONFIG, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def save_config(cfg):
+    """Write the whole config back, preserving structure and unicode."""
+    with open(BUTTONS_CONFIG, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, indent=2, ensure_ascii=False)
+
+
 def build_lead_values(row):
     """Flat dict the template engine fills from. Missing fields become blank."""
     g = lambda k: (row[k] or "").strip() if k in row.keys() and row[k] else ""

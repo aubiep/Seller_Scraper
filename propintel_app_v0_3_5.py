@@ -1,5 +1,5 @@
 """
-PropIntel Dashboard  v0.3.4
+PropIntel Dashboard  v0.3.5
 ===========================
 A local web app over propintel.db. Runs entirely on your machine; the only
 outbound actions are ones you trigger: Homebot enrollment and iAuto letter sends.
@@ -7,7 +7,7 @@ This is the unified-app home: see leads, work the review queue, pull mailing
 lists, queue and send iAuto handwritten notes, and enroll seller leads on Homebot.
 
 Run:
-    python propintel_app_v0_3_4.py
+    python propintel_app_v0_3_5.py
 Then open http://127.0.0.1:5000 (this PC) or http://<this-PC-LAN-IP>:5000
 (a phone/tablet on the same WiFi - the startup prints the exact URL).
 
@@ -19,9 +19,22 @@ Screens:
                    badge, filters, Add-contact form, per-row queue + enroll
     /property/<id> Full lead detail - assessor record, photos, every submission
     /letters       iAuto letter queue - queue/re-template a note, send, enroll
+    /letters/templates  Manage letter templates - upload a new iAuto design, name
+                   it, edit each blank's wording (no config editing)
     /letters/bulk  Bulk mail - filter a lead list, then queue letters in one pass
     /homebot       Homebot - enroll verified seller leads on the Market Digest
     /contacts      -> redirects to /leads (merged in v0.3.0)
+
+New in v0.3.5 (supersedes v0.3.4):
+    - Self-service letter templates (/letters/templates). Upload an iAuto design
+      .json, give it a friendly name, and it becomes a queue option - no hand
+      editing of config/iauto_templates.json. The merge blanks are auto-detected
+      from the template (iauto_template.list_merge_cells) and seeded with their
+      baked-in text; the standard envelope is reused automatically. An edit screen
+      (/letters/templates/<key>) lets you rename and reword each blank, with
+      click-to-insert {placeholder} chips. Delete removes the button (design file
+      stays on disk). Backed by iauto_send.load_config/save_config (whole-config
+      read/write that preserves _about/_field_notes). 8 MB upload cap.
 
 New in v0.3.4 (supersedes v0.3.3):
     - Row thumbnails fall back to the county assessor photo when Google has no
@@ -116,19 +129,38 @@ v0.2.1:
     - /letters working queue: queue a letter, Send letter / Send envelope per row.
 """
 
+import json
 import os
+import re
 from flask import Flask, request, render_template_string, redirect, url_for, send_file, abort
 
 import propintel_db_v0_1_0 as pdb
 import homebot_push_v0_1_0 as hbpush
 import iauto_send_v0_1_0 as iautosend
+import iauto_template_v0_1_0 as iautotmpl
 import propintel_backup_v0_1_0 as backup
 import lead_priority_v0_1_0 as priority
 import geocode_v0_1_0 as geocode
 import reenrich_v0_1_0 as reenrich
 
 app = Flask(__name__)
-DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), pdb.DEFAULT_DB_FILENAME)
+app.config["MAX_CONTENT_LENGTH"] = 8 * 1024 * 1024  # 8 MB cap on template uploads
+HERE = os.path.dirname(os.path.abspath(__file__))
+DB_PATH = os.path.join(HERE, pdb.DEFAULT_DB_FILENAME)
+IAUTO_DIR = os.path.join(HERE, "Iauto")
+
+# Lead/property fields a template blank can be filled from. Shown as click-to-insert
+# chips on the template editor; these are the keys iauto_send.build_lead_values emits.
+TEMPLATE_PLACEHOLDERS = [
+    ("{first_name}", "Lead's first name"),
+    ("{last_name}", "Lead's last name"),
+    ("{property_address}", "Property street address"),
+    ("{property_city}", "Property city"),
+    ("{mail_street}", "Mailing street"),
+    ("{mail_city}", "Mailing city"),
+    ("{mail_state}", "Mailing state"),
+    ("{mail_zip}", "Mailing ZIP"),
+]
 
 
 def db():
@@ -166,8 +198,11 @@ BASE = """
   .NO{background:rgba(138,151,166,.18);color:var(--mut)}
   .mut{color:var(--mut)} .reason{color:var(--mut);font-size:13px}
   form.filters{display:flex;gap:10px;margin-bottom:16px;flex-wrap:wrap}
-  input,select{background:var(--panel2);border:1px solid var(--line);color:var(--txt);
+  input,select,textarea{background:var(--panel2);border:1px solid var(--line);color:var(--txt);
     padding:8px 10px;border-radius:8px;font:inherit}
+  textarea{width:100%;max-width:560px;resize:vertical}
+  .chips{display:flex;gap:6px;flex-wrap:wrap;margin:6px 0 14px}
+  .chip{font-size:12px} .fieldrow{margin:10px 0;max-width:560px}
   button{background:var(--accent);border:none;color:#fff;padding:8px 16px;border-radius:8px;font-weight:600;cursor:pointer}
   button.ghost{background:transparent;border:1px solid var(--line);color:var(--txt)}
   button.danger{background:var(--bad)} button.sm{padding:5px 10px;font-size:13px}
@@ -213,6 +248,7 @@ BASE = """
     <a href="/priority" class="{{ 'active' if title=='Priority' else '' }}">Priority</a>
     <a href="/leads" class="{{ 'active' if title=='Leads' else '' }}">Leads</a>
     <a href="/letters" class="{{ 'active' if title=='Letters' else '' }}">Letters</a>
+    <a href="/letters/templates" class="{{ 'active' if title=='Templates' else '' }}">Templates</a>
     <a href="/letters/bulk" class="{{ 'active' if title=='Bulk' else '' }}">Bulk mail</a>
     <a href="/homebot" class="{{ 'active' if title=='Homebot' else '' }}">Homebot</a>
   </nav>
@@ -1035,10 +1071,184 @@ def letters():
             "reason; fix it and send again.</div>")
     banner = f"<div class='banner'>{esc(msg)}</div>" if msg else ""
     body = (f"<h2>iAuto letter queue</h2>"
-            f"<div class='sub'>Queue handwritten notes and send them to the machine.</div>"
+            f"<div class='sub'>Queue handwritten notes and send them to the machine. "
+            f"<a href='/letters/templates'>Manage templates</a> to add or edit letters.</div>"
             f"{banner}{queue_form}<h2>Queue</h2>{send_all}{table}{note}")
     conn.close()
     return page("Letters", body)
+
+
+# ── iAuto template self-service (upload / name / edit wording) ───────────────
+
+def _template_slug(name):
+    s = re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_")
+    return s or "template"
+
+
+def _unique_key(base, existing):
+    key, n = base, 2
+    while key in existing:
+        key, n = f"{base}_{n}", n + 1
+    return key
+
+
+def _standard_envelope_spec(cfg):
+    """Reuse the envelope from any existing template so new ones address mail the
+    same way without the user configuring it. Deep-copied. None if there is none."""
+    for b in cfg.get("buttons", {}).values():
+        if b.get("envelope"):
+            return json.loads(json.dumps(b["envelope"]))
+    return None
+
+
+@app.route("/letters/templates")
+def templates_manage():
+    msg = request.args.get("msg", "")
+    cfg = iautosend.load_config()
+    buttons = cfg.get("buttons", {})
+    rows = ""
+    for k, b in buttons.items():
+        letter = (b.get("letter") or {}).get("path", "")
+        nfields = len((b.get("letter") or {}).get("fields") or {})
+        has_env = "Yes" if b.get("envelope") else "No"
+        del_form = (
+            "<form class='rowform' method='post' "
+            f"action='/letters/templates/{esc(k)}/delete' "
+            "onsubmit=\"return confirm('Delete this template? The design file stays on disk.');\">"
+            "<button class='sm danger'>Delete</button></form>")
+        rows += (
+            f"<tr><td><b>{esc(b.get('label', k))}</b><div class='mut'>{esc(k)}</div></td>"
+            f"<td class='mut'>{esc(letter)}</td><td>{nfields}</td><td>{esc(has_env)}</td>"
+            f"<td><a class='sm' href='/letters/templates/{esc(k)}'>Edit wording</a> {del_form}</td></tr>")
+    table = (f"<table><tr><th>Template</th><th>Design file</th><th>Blanks</th>"
+             f"<th>Envelope</th><th></th></tr>{rows}</table>"
+             if rows else "<div class='empty'>No templates yet. Add one below.</div>")
+    add = (
+        "<h2>Add a new template</h2>"
+        "<div class='sub'>Export your letter design from the iAuto machine as a .json file, "
+        "upload it here, and give it a name. The blanks are detected automatically; you can "
+        "tweak the wording on the next screen.</div>"
+        "<form class='filters' method='post' action='/letters/templates/new' enctype='multipart/form-data'>"
+        "<input type='text' name='name' placeholder='Template name (e.g. Just Listed)' required>"
+        "<input type='file' name='file' accept='.json,application/json' required>"
+        "<button>Upload template</button></form>")
+    banner = f"<div class='banner'>{esc(msg)}</div>" if msg else ""
+    body = ("<h2>Letter templates</h2>"
+            "<div class='sub'>The letters you can pick when queuing iAuto notes.</div>"
+            f"{banner}{add}<h2>Your templates</h2>{table}")
+    return page("Templates", body)
+
+
+@app.route("/letters/templates/new", methods=["POST"])
+def template_new():
+    name = (request.form.get("name") or "").strip()
+    f = request.files.get("file")
+    if not name:
+        return redirect(url_for("templates_manage", msg="Please enter a template name."))
+    if not f or not f.filename:
+        return redirect(url_for("templates_manage", msg="Please choose a template .json file to upload."))
+    raw = f.read()
+    try:
+        tmpl = json.loads(raw.decode("utf-8"))
+    except Exception:
+        return redirect(url_for("templates_manage",
+                                msg="That file isn't a valid iAuto template (couldn't read it as JSON)."))
+    cells = [c for c in iautotmpl.list_merge_cells(tmpl) if c.get("cell")]
+    if not cells:
+        return redirect(url_for("templates_manage",
+                                msg="No editable blanks found in that template. Make sure it has merge fields."))
+    cfg = iautosend.load_config()
+    key = _unique_key(_template_slug(name), cfg.get("buttons", {}))
+    os.makedirs(IAUTO_DIR, exist_ok=True)
+    filename = key + ".json"
+    with open(os.path.join(IAUTO_DIR, filename), "wb") as out:
+        out.write(raw)
+    fields = {c["cell"]: (c.get("current") if isinstance(c.get("current"), str) else "")
+              for c in cells}
+    entry = {"label": name, "letter": {"path": f"Iauto/{filename}", "fields": fields}}
+    env = _standard_envelope_spec(cfg)
+    if env:
+        entry["envelope"] = env
+    cfg.setdefault("buttons", {})[key] = entry
+    iautosend.save_config(cfg)
+    return redirect(url_for("template_edit_page", key=key,
+                            msg="Template added. Review the wording below, then it's ready to queue."))
+
+
+@app.route("/letters/templates/<key>")
+def template_edit_page(key):
+    msg = request.args.get("msg", "")
+    cfg = iautosend.load_config()
+    b = cfg.get("buttons", {}).get(key)
+    if not b:
+        abort(404)
+    fields = (b.get("letter") or {}).get("fields") or {}
+    chips = " ".join(
+        f"<button type='button' class='sm ghost chip' data-token='{esc(tok)}' "
+        f"title='{esc(desc)}'>{esc(tok)}</button>" for tok, desc in TEMPLATE_PLACEHOLDERS)
+    cell_inputs = "".join(
+        f"<div class='fieldrow'><label class='flab'>Blank {esc(cell)}</label>"
+        f"<textarea name='cell_{esc(cell)}' rows='2'>{esc(text)}</textarea></div>"
+        for cell, text in fields.items())
+    if not cell_inputs:
+        cell_inputs = "<div class='mut'>This template has no editable blanks.</div>"
+    env_note = ("<div class='note'>Envelopes use your standard envelope automatically.</div>"
+                if b.get("envelope") else
+                "<div class='note'>No envelope is set for this template; only the letter will send.</div>")
+    banner = f"<div class='banner'>{esc(msg)}</div>" if msg else ""
+    form = (
+        f"<form method='post' action='/letters/templates/{esc(key)}/edit'>"
+        "<label class='flab'>Template name</label><br>"
+        f"<input type='text' name='label' value='{esc(b.get('label', key))}' required style='min-width:300px'>"
+        "<div class='sub' style='margin:16px 0 6px'>Click a tag to drop it where your cursor is. "
+        "Tags fill in automatically for each lead.</div>"
+        f"<div class='chips'>{chips}</div>{cell_inputs}"
+        "<div class='actions'><button>Save wording</button>"
+        "<a class='sm ghost' href='/letters/templates'>Back to templates</a></div></form>")
+    script = (
+        "<script>(function(){var last=null;"
+        "document.querySelectorAll('textarea').forEach(function(t){"
+        "t.addEventListener('focus',function(){last=t;});});"
+        "document.querySelectorAll('.chip').forEach(function(c){"
+        "c.addEventListener('click',function(){var tok=c.getAttribute('data-token');"
+        "var t=last||document.querySelector('textarea');if(!t)return;"
+        "var s=t.selectionStart,e=t.selectionEnd;"
+        "t.value=t.value.slice(0,s)+tok+t.value.slice(e);t.focus();"
+        "t.selectionStart=t.selectionEnd=s+tok.length;});});})();</script>")
+    body = (f"<h2>Edit template: {esc(b.get('label', key))}</h2>"
+            "<div class='sub'>Change the name or the wording of each blank.</div>"
+            f"{banner}{env_note}{form}{script}")
+    return page("Templates", body)
+
+
+@app.route("/letters/templates/<key>/edit", methods=["POST"])
+def template_edit_save(key):
+    cfg = iautosend.load_config()
+    b = cfg.get("buttons", {}).get(key)
+    if not b:
+        abort(404)
+    label = (request.form.get("label") or "").strip()
+    if label:
+        b["label"] = label
+    fields = (b.get("letter") or {}).get("fields") or {}
+    for cell in list(fields.keys()):
+        v = request.form.get(f"cell_{cell}")
+        if v is not None:
+            fields[cell] = v
+    iautosend.save_config(cfg)
+    return redirect(url_for("template_edit_page", key=key, msg="Saved."))
+
+
+@app.route("/letters/templates/<key>/delete", methods=["POST"])
+def template_delete(key):
+    cfg = iautosend.load_config()
+    if key in cfg.get("buttons", {}):
+        cfg["buttons"].pop(key)
+        iautosend.save_config(cfg)
+        msg = "Template deleted."
+    else:
+        msg = "Template not found."
+    return redirect(url_for("templates_manage", msg=msg))
 
 
 @app.route("/iauto/queue", methods=["POST"])
