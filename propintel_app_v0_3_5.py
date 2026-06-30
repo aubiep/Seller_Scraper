@@ -35,6 +35,12 @@ New in v0.3.5 (supersedes v0.3.4):
       click-to-insert {placeholder} chips. Delete removes the button (design file
       stays on disk). Backed by iauto_send.load_config/save_config (whole-config
       read/write that preserves _about/_field_notes). 8 MB upload cap.
+    - The editor flags UNRECOGNIZED {tags} (a typo or unknown variable that would
+      otherwise print literally on the letter), naming the blank and the bad tag.
+    - Merge variables are now a single source of truth: iauto_send.PLACEHOLDER_FIELDS
+      (token, description, func) drives the chips, the fill logic, AND the warning,
+      so adding a variable is one row there. Added full_name, property_state,
+      property_zip alongside the existing first_name/last_name/property_*/mail_*.
 
 New in v0.3.4 (supersedes v0.3.3):
     - Row thumbnails fall back to the county assessor photo when Google has no
@@ -149,18 +155,21 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(HERE, pdb.DEFAULT_DB_FILENAME)
 IAUTO_DIR = os.path.join(HERE, "Iauto")
 
-# Lead/property fields a template blank can be filled from. Shown as click-to-insert
-# chips on the template editor; these are the keys iauto_send.build_lead_values emits.
-TEMPLATE_PLACEHOLDERS = [
-    ("{first_name}", "Lead's first name"),
-    ("{last_name}", "Lead's last name"),
-    ("{property_address}", "Property street address"),
-    ("{property_city}", "Property city"),
-    ("{mail_street}", "Mailing street"),
-    ("{mail_city}", "Mailing city"),
-    ("{mail_state}", "Mailing state"),
-    ("{mail_zip}", "Mailing ZIP"),
-]
+# Click-to-insert chips for the template editor, derived from the single source
+# of truth in iauto_send (so chips, fill logic, and the unknown-tag warning agree).
+TEMPLATE_PLACEHOLDERS = [(f"{{{tok}}}", desc) for tok, desc, _fn in iautosend.PLACEHOLDER_FIELDS]
+SUPPORTED_TOKENS = iautosend.SUPPORTED_TOKENS
+
+
+def _unknown_tokens(fields):
+    """{cell: [bad tags]} for any {tag} in a blank that isn't a supported variable
+    (a typo / unknown name that would print literally on the letter)."""
+    bad = {}
+    for cell, text in (fields or {}).items():
+        for name in re.findall(r"\{([^{}]*)\}", text or ""):
+            if name not in SUPPORTED_TOKENS:
+                bad.setdefault(cell, []).append("{" + name + "}")
+    return bad
 
 
 def db():
@@ -1195,6 +1204,14 @@ def template_edit_page(key):
     env_note = ("<div class='note'>Envelopes use your standard envelope automatically.</div>"
                 if b.get("envelope") else
                 "<div class='note'>No envelope is set for this template; only the letter will send.</div>")
+    bad = _unknown_tokens(fields)
+    warn = ""
+    if bad:
+        items = "; ".join(f"{esc(cell)} &rarr; {esc(', '.join(toks))}" for cell, toks in bad.items())
+        warn = ("<div class='note' style='border-left-color:var(--bad);color:var(--txt)'>"
+                "<b>Unrecognized tags.</b> These will print as literal text on the letter "
+                f"because they aren't supported variables: {items}. "
+                "Fix them with a tag from the list below, or remove the curly braces.</div>")
     banner = f"<div class='banner'>{esc(msg)}</div>" if msg else ""
     form = (
         f"<form method='post' action='/letters/templates/{esc(key)}/edit'>"
@@ -1217,7 +1234,7 @@ def template_edit_page(key):
         "t.selectionStart=t.selectionEnd=s+tok.length;});});})();</script>")
     body = (f"<h2>Edit template: {esc(b.get('label', key))}</h2>"
             "<div class='sub'>Change the name or the wording of each blank.</div>"
-            f"{banner}{env_note}{form}{script}")
+            f"{banner}{warn}{env_note}{form}{script}")
     return page("Templates", body)
 
 

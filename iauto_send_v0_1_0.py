@@ -51,23 +51,40 @@ def save_config(cfg):
         json.dump(cfg, f, indent=2, ensure_ascii=False)
 
 
+def _g(row, k):
+    """Clean string for column k, or '' if missing/blank."""
+    return (row[k] or "").strip() if k in row.keys() and row[k] else ""
+
+
+# Single source of truth for the merge variables a letter/envelope blank can use.
+# The dashboard reads this for the click-to-insert chips AND the "unknown tag"
+# warning; build_lead_values() fills from it. To ADD a variable: add one row
+# (token, description, func) where func(row) returns the text. `row` is a lead_row
+# result; if you reference a new column, add it to lead_row()'s SELECT below too.
+PLACEHOLDER_FIELDS = [
+    ("first_name",       "Lead's first name",        lambda r: _g(r, "first_name")),
+    ("last_name",        "Lead's last name",         lambda r: _g(r, "last_name")),
+    ("full_name",        "First + last name",        lambda r: (_g(r, "first_name") + " " + _g(r, "last_name")).strip()),
+    ("property_address", "Property street address",  lambda r: _g(r, "property_street")),
+    ("property_city",    "Property city",            lambda r: _g(r, "property_city")),
+    ("property_state",   "Property state",           lambda r: _g(r, "property_state")),
+    ("property_zip",     "Property ZIP",             lambda r: _g(r, "property_zip")),
+    ("mail_street",      "Mailing street",           lambda r: _g(r, "property_street")),
+    ("mail_city",        "Mailing city",             lambda r: _g(r, "property_city")),
+    ("mail_state",       "Mailing state",            lambda r: _g(r, "property_state")),
+    ("mail_zip",         "Mailing ZIP",              lambda r: _g(r, "property_zip")),
+]
+
+SUPPORTED_TOKENS = {tok for tok, _desc, _fn in PLACEHOLDER_FIELDS}
+
+
 def build_lead_values(row):
     """Flat dict the template engine fills from. Missing fields become blank."""
-    g = lambda k: (row[k] or "").strip() if k in row.keys() and row[k] else ""
-    street = g("property_street")
-    return {
-        "first_name": g("first_name"),
-        "last_name": g("last_name"),
-        "property_address": street,
-        "property_city": g("property_city"),
-        "mail_street": street,
-        "mail_city": g("property_city"),
-        "mail_state": g("property_state"),
-        "mail_zip": g("property_zip"),
-    }
+    return {tok: fn(row) for tok, _desc, fn in PLACEHOLDER_FIELDS}
 
 
 def lead_row(conn, contact_id, property_id):
+    # Columns here must cover every field PLACEHOLDER_FIELDS reads.
     return conn.execute(
         "SELECT ct.first_name, ct.last_name, p.property_street, p.property_city, "
         "p.property_state, p.property_zip "
