@@ -22,6 +22,8 @@ runs regardless, so queueing and previewing work with no machine present.
 
 import json
 import os
+import re
+from datetime import datetime
 
 import requests
 
@@ -56,6 +58,48 @@ def _g(row, k):
     return (row[k] or "").strip() if k in row.keys() and row[k] else ""
 
 
+def _num(s):
+    """Parse a number out of a messy string ('$1,250,000' -> 1250000.0), else None.
+    Mirrors lead_priority so equity/value variables match the priority page."""
+    if s is None:
+        return None
+    t = re.sub(r"[^\d.]", "", str(s))
+    if not t:
+        return None
+    try:
+        return float(t)
+    except ValueError:
+        return None
+
+
+def _money(s):
+    """'$1,250,000' for a parseable amount, else '' (so a blank never prints '$0')."""
+    n = _num(s)
+    return f"${n:,.0f}" if n else ""
+
+
+def _years_owned(date_str):
+    """Whole years since the last sale, as a string, or '' if no/odd date."""
+    if not date_str:
+        return ""
+    for fmt in ("%m/%d/%Y", "%Y-%m-%d", "%m/%d/%y"):
+        try:
+            d = datetime.strptime(str(date_str).strip(), fmt)
+            return str(int((datetime.now() - d).days / 365.25))
+        except ValueError:
+            continue
+    return ""
+
+
+def _equity(row):
+    """Estimated equity since purchase = market total - last sale price, as money.
+    Blank unless both are known and market > sale (same rule as the priority page)."""
+    sale, market = _num(_g(row, "most_recent_sale_amount")), _num(_g(row, "market_total"))
+    if sale and market and market > sale:
+        return f"${market - sale:,.0f}"
+    return ""
+
+
 # Single source of truth for the merge variables a letter/envelope blank can use.
 # The dashboard reads this for the click-to-insert chips AND the "unknown tag"
 # warning; build_lead_values() fills from it. To ADD a variable: add one row
@@ -73,6 +117,17 @@ PLACEHOLDER_FIELDS = [
     ("mail_city",        "Mailing city",             lambda r: _g(r, "property_city")),
     ("mail_state",       "Mailing state",            lambda r: _g(r, "property_state")),
     ("mail_zip",         "Mailing ZIP",              lambda r: _g(r, "property_zip")),
+    # Property-data variables (from the assessor record the scraper pulls). Each is
+    # blank when the county didn't have it, so design sentences to read fine empty.
+    ("years_owned",      "Whole years since last sale",   lambda r: _years_owned(_g(r, "most_recent_sale_date"))),
+    ("last_sale_price",  "Last sale price ($)",           lambda r: _money(_g(r, "most_recent_sale_amount"))),
+    ("last_sale_date",   "Last sale date",                lambda r: _g(r, "most_recent_sale_date")),
+    ("market_value",     "Assessor market value ($)",     lambda r: _money(_g(r, "market_total"))),
+    ("assessed_value",   "Assessed value ($)",            lambda r: _money(_g(r, "assessed_value"))),
+    ("equity_estimate",  "Est. equity since purchase ($)", lambda r: _equity(r)),
+    ("year_built",       "Year built",                    lambda r: _g(r, "year_built")),
+    ("beds",             "Bedrooms",                      lambda r: _g(r, "bedrooms")),
+    ("baths",            "Bathrooms (full/three-quarter)", lambda r: _g(r, "baths_full_three_quarter")),
 ]
 
 SUPPORTED_TOKENS = {tok for tok, _desc, _fn in PLACEHOLDER_FIELDS}
@@ -87,7 +142,9 @@ def lead_row(conn, contact_id, property_id):
     # Columns here must cover every field PLACEHOLDER_FIELDS reads.
     return conn.execute(
         "SELECT ct.first_name, ct.last_name, p.property_street, p.property_city, "
-        "p.property_state, p.property_zip "
+        "p.property_state, p.property_zip, p.most_recent_sale_date, "
+        "p.most_recent_sale_amount, p.market_total, p.assessed_value, "
+        "p.year_built, p.bedrooms, p.baths_full_three_quarter "
         "FROM contacts ct, properties p WHERE ct.id=? AND p.id=?",
         (contact_id, property_id),
     ).fetchone()
