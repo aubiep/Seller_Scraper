@@ -42,3 +42,6 @@ HomebotAPI/
 __pycache__/
 *.pyc
 *.pyo
+
+# Temp letter previews
+_letter_preview.html

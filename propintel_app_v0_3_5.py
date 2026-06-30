@@ -21,6 +21,8 @@ Screens:
     /letters       iAuto letter queue - queue/re-template a note, send, enroll
     /letters/templates  Manage letter templates - upload a new iAuto design, name
                    it, edit each blank's wording (no config editing)
+    /letter/<cid>/<pid> Print-ready typed seller letter for one lead (the typed
+                   half of the print + iAuto handwriting hybrid). Opens standalone.
     /letters/bulk  Bulk mail - filter a lead list, then queue letters in one pass
     /homebot       Homebot - enroll verified seller leads on the Market Digest
     /contacts      -> redirects to /leads (merged in v0.3.0)
@@ -41,6 +43,12 @@ New in v0.3.5 (supersedes v0.3.4):
       (token, description, func) drives the chips, the fill logic, AND the warning,
       so adding a variable is one row there. Added full_name, property_state,
       property_zip alongside the existing first_name/last_name/property_*/mail_*.
+    - Hybrid print+pen letters, Part 1: a "Generate letter" button on each lead
+      (property detail) opens a print-ready typed seller letter (the Soft Master),
+      merges filled from the lead record, with a reserved blank zone where the
+      iAuto will pen the handwritten note + signature (Part 2). Rendering lives in
+      letter_print_v0_1_0.py; templates in config/letter_templates.json (seeded with
+      the Soft Master). See Hybrid_Letter_System_Plan.md for the full design.
 
 New in v0.3.4 (supersedes v0.3.3):
     - Row thumbnails fall back to the county assessor photo when Google has no
@@ -144,6 +152,7 @@ import propintel_db_v0_1_0 as pdb
 import homebot_push_v0_1_0 as hbpush
 import iauto_send_v0_1_0 as iautosend
 import iauto_template_v0_1_0 as iautotmpl
+import letter_print_v0_1_0 as letterprint
 import propintel_backup_v0_1_0 as backup
 import lead_priority_v0_1_0 as priority
 import geocode_v0_1_0 as geocode
@@ -1365,6 +1374,23 @@ def photo(pid, which):
     return send_file(path)
 
 
+@app.route("/letter/<int:cid>/<int:pid>")
+def letter_print(cid, pid):
+    """Print-ready typed letter for one lead (the typed half of the print + iAuto
+    hybrid). Opens standalone in a new tab; not wrapped in the dashboard chrome."""
+    template = request.args.get("template", "soft_master")
+    conn = db()
+    row = iautosend.lead_row(conn, cid, pid)
+    conn.close()
+    if not row:
+        abort(404)
+    values = iautosend.build_lead_values(row)
+    html_doc, err = letterprint.render_letter(template, values)
+    if err:
+        abort(404)
+    return html_doc
+
+
 @app.route("/lead/<int:cid>/<int:pid>/reenrich", methods=["POST"])
 def lead_reenrich(cid, pid):
     """Re-run the county assessor lookup for one lead (reenrich_v0_1_0). On a
@@ -1466,6 +1492,10 @@ def property_detail(pid):
             f"<input type='hidden' name='lead' value='{le['contact_id']}:{pid}'>"
             "<input type='hidden' name='template' value='seller_lead_initial'>"
             "<button class='sm'>Queue iAuto letter</button></form>")
+        gen_letter_btn = (
+            f"<a class='sm ghost' style='display:inline-block;margin-top:4px' "
+            f"href='/letter/{le['contact_id']}/{pid}' target='_blank' rel='noopener'>"
+            "Generate letter</a>")
         enroll_btn = homebot_action_cell(conn, le["contact_id"], pid, hb_status, next_pid=pid)
         reenrich_btn = (
             "<form class='rowform' method='post' action='/lead/"
@@ -1483,7 +1513,7 @@ def property_detail(pid):
             f"<td class='mut'>{esc(le['lead_type'] or '')} &middot; {esc(le['lead_source'] or '')}"
             f"<br>{esc(le['received_date'] or '')}</td>"
             f"<td class='reason'>{esc(le['match_reason'] or '')}</td>"
-            f"<td>{queue_btn}</td><td>{enroll_btn}</td></tr>")
+            f"<td>{queue_btn}{gen_letter_btn}</td><td>{enroll_btn}</td></tr>")
     leads_table = (
         "<table><tr><th>Contact</th><th>Verdict</th><th>Contact info</th><th>Lead</th>"
         f"<th>Why</th><th>Letter</th><th>Homebot</th></tr>{lead_rows}</table>") if leads else \
