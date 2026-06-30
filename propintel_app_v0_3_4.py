@@ -1,5 +1,5 @@
 """
-PropIntel Dashboard  v0.3.3
+PropIntel Dashboard  v0.3.4
 ===========================
 A local web app over propintel.db. Runs entirely on your machine; the only
 outbound actions are ones you trigger: Homebot enrollment and iAuto letter sends.
@@ -7,7 +7,7 @@ This is the unified-app home: see leads, work the review queue, pull mailing
 lists, queue and send iAuto handwritten notes, and enroll seller leads on Homebot.
 
 Run:
-    python propintel_app_v0_3_3.py
+    python propintel_app_v0_3_4.py
 Then open http://127.0.0.1:5000 (this PC) or http://<this-PC-LAN-IP>:5000
 (a phone/tablet on the same WiFi - the startup prints the exact URL).
 
@@ -22,6 +22,14 @@ Screens:
     /letters/bulk  Bulk mail - filter a lead list, then queue letters in one pass
     /homebot       Homebot - enroll verified seller leads on the Market Digest
     /contacts      -> redirects to /leads (merged in v0.3.0)
+
+New in v0.3.4 (supersedes v0.3.3):
+    - Row thumbnails fall back to the county assessor photo when Google has no
+      Street View image for the address (rural roads). street_thumb() now takes
+      the assessor file too; the daily home, priority worklist, and /leads
+      queries carry p.assessor_photo_file. Pairs with streetview_backfill_v0_1_0,
+      which re-fetched real Street View photos for the 43 older rows that had none
+      (Google metadata pre-check skips the gray "no imagery" placeholder).
 
 New in v0.3.3 (supersedes v0.3.2):
     - "Re-run assessor lookup" button on every lead row of the property detail
@@ -238,13 +246,18 @@ def kvc(label, val, hi=False):
     return f"<div class='{cls}'><div class='k'>{esc(label)}</div><div class='v'>{_v(val)}</div></div>"
 
 
-def street_thumb(pid, photo_file):
-    """Street View thumbnail (Google Maps photo, not the assessor photo).
-    Blank placeholder when no Street View image exists for the row."""
+def street_thumb(pid, photo_file, assessor_file=None):
+    """Row thumbnail. Prefers the Google Street View photo; falls back to the
+    county assessor photo when no Street View image exists for the row (rural
+    addresses Google doesn't cover). Blank placeholder when neither exists."""
     if photo_file and os.path.exists(photo_file):
-        return (f"<a href='/property/{pid}'>"
-                f"<img class='thumb' src='/photo/{pid}/street' alt='' loading='lazy'></a>")
-    return "<span class='thumb ph'></span>"
+        which = "street"
+    elif assessor_file and os.path.exists(assessor_file):
+        which = "assessor"
+    else:
+        return "<span class='thumb ph'></span>"
+    return (f"<a href='/property/{pid}'>"
+            f"<img class='thumb' src='/photo/{pid}/{which}' alt='' loading='lazy'></a>")
 
 
 def repeat_badge(sub_counts, contact_id):
@@ -315,7 +328,7 @@ def dashboard():
             name = f"{r['first_name']} {r['last_name']}".strip()
             pid = r["property_id"]
             nl += (
-                f"<tr><td>{street_thumb(pid, r['photo_file'])}</td>"
+                f"<tr><td>{street_thumb(pid, r['photo_file'], r['assessor_photo_file'])}</td>"
                 f"<td><a class='rowlink' href='/property/{pid}'>{esc(name)}</a>"
                 f"{repeat_badge(subs, r['contact_id'])}"
                 f"<div class='mut'>{esc(r['property_city'] or '')}</div></td>"
@@ -352,7 +365,7 @@ def dashboard():
             why = ", ".join(lbl for lbl, _ in item["factors"]) or "—"
             pr += (
                 f"<tr><td><span class='score {_score_class(item['score'])}'>{item['score']}</span></td>"
-                f"<td>{street_thumb(r['property_id'], r['photo_file'])}</td>"
+                f"<td>{street_thumb(r['property_id'], r['photo_file'], r['assessor_photo_file'])}</td>"
                 f"<td><a class='rowlink' href='/property/{r['property_id']}'>{esc(name)}</a>"
                 f"<div class='mut'>{esc(r['property_city'] or '')}</div></td>"
                 f"<td>{pill(r['ownership_match'] or '—')}</td>"
@@ -417,7 +430,7 @@ def priority_view():
             "<button class='sm'>Queue letter</button></form>")
         rows += (
             f"<tr><td><span class='score {_score_class(item['score'])}'>{item['score']}</span></td>"
-            f"<td>{street_thumb(pid, r['photo_file'])}</td>"
+            f"<td>{street_thumb(pid, r['photo_file'], r['assessor_photo_file'])}</td>"
             f"<td><a class='rowlink' href='/property/{pid}'>{esc(name)}</a>"
             f"<div class='mut'>{esc(r['property_city'] or '')}</div></td>"
             f"<td>{pill(r['ownership_match'])}</td>"
@@ -557,7 +570,7 @@ def leads():
         "SELECT le.contact_id, le.property_id AS pid, MAX(le.id) leid, "
         "c.first_name, c.last_name, c.email, c.phone, c.contact_type, "
         "le.lead_type, le.lead_source, le.ownership_match, le.match_confidence, "
-        "le.received_date, p.photo_file, p.property_city, p.property_zip, "
+        "le.received_date, p.photo_file, p.assessor_photo_file, p.property_city, p.property_zip, "
         "p.property_address "
         "FROM lead_events le "
         "JOIN contacts c   ON c.id = le.contact_id "
@@ -577,7 +590,7 @@ def leads():
     for r in rows:
         name = f"{r['first_name']} {r['last_name']}".strip()
         body_rows += (
-            f"<tr><td>{street_thumb(r['pid'], r['photo_file'])}</td>"
+            f"<tr><td>{street_thumb(r['pid'], r['photo_file'], r['assessor_photo_file'])}</td>"
             f"<td><a class='rowlink' href='/property/{r['pid']}'>{esc(name)}</a>"
             f"{repeat_badge(subs, r['contact_id'])} "
             f"<a class='back' href='/contact/{r['contact_id']}/edit?next_pid={r['pid']}'>edit</a>"

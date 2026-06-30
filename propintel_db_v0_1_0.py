@@ -836,7 +836,7 @@ def new_unprocessed_leads(conn, limit=25):
         "SELECT le.contact_id, le.property_id, MAX(le.id) leid, "
         "c.first_name, c.last_name, c.email, le.lead_type, le.lead_source, "
         "le.ownership_match, le.received_date, "
-        "p.property_address, p.property_city, p.photo_file "
+        "p.property_address, p.property_city, p.photo_file, p.assessor_photo_file "
         "FROM lead_events le "
         "JOIN contacts c   ON c.id = le.contact_id "
         "JOIN properties p ON p.id = le.property_id "

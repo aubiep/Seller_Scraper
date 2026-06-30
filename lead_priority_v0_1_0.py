@@ -129,7 +129,7 @@ _SQL = """
 SELECT le.id, le.ownership_match, le.received_date, le.lead_type,
        le.match_confidence, le.contact_id, le.property_id,
        c.first_name, c.last_name, c.email, c.phone,
-       p.photo_file,
+       p.photo_file, p.assessor_photo_file,
        p.property_address, p.property_street, p.property_city,
        p.most_recent_sale_date, p.most_recent_sale_amount, p.market_total,
        p.assessed_value, p.tax_address, p.owner_address
