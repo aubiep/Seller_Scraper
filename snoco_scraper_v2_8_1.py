@@ -1,8 +1,20 @@
 """
-Property Tax Record Scraper  v2.8.0
+Property Tax Record Scraper  v2.8.1
 ====================================
 Automated property data extraction for Snohomish County AND King County.
 County is auto-detected from the address city name.
+
+v2.8.1 Changes (Snohomish rich detail restored):
+    - Snohomish leads now get assessed value, market total, last sale date + price,
+      full sales history, and year built again - not just owner/parcel/address.
+      The data comes from the parcel's Property Account Summary page, where each
+      fact is a "DataDisplay" JSON table fetched from /API/DataDisplay/DataSources/
+      GetData keyed by the table's ModuleId (read off the page; tables identified
+      by column name so it survives ModuleId changes). snoho_fetch_detail() pulls
+      it; scrape_property() chains it onto the search result (which supplies the
+      parcel keys). Best-effort: a detail hiccup never drops the lead.
+    - Beds/baths/finished sqft are NOT published on this portal, so they stay blank
+      (the one remaining gap vs the old snoco.org scrape and vs King County).
 
 v2.8.0 Changes (Snohomish County moved to the Public Access portal):
     - REBUILT the Snohomish path. The county retired the old snoco.org/proptax
@@ -325,6 +337,13 @@ SNOHO_BASE        = "https://wa-snohomish.publicaccessnow.com"
 SNOHO_SEARCH_PAGE = SNOHO_BASE + "/PropertyInformation/PropertySearch.aspx?moduleId=470"
 SNOHO_GETDATA     = SNOHO_BASE + "/DesktopModules/QuickSearch/API/Module/GetData"
 SNOHO_MODULE_ID   = "470"
+# v2.8.1: rich detail (assessed value, last sale, year built, sales history) comes
+# from the parcel's Property Account Summary page. That page hosts several
+# "DataDisplay" module tables, each fetched as JSON from this endpoint keyed by the
+# table's own ModuleId. We read the table ModuleIds off the summary page and
+# identify each table by its column names (robust to ModuleId changes).
+SNOHO_SUMMARY_PAGE = SNOHO_BASE + "/PropertyInformation/PropertySearch/PropertyAccountSummary.aspx"
+SNOHO_DD_GETDATA   = SNOHO_BASE + "/API/DataDisplay/DataSources/GetData"
 
 OUTPUT_CSV  = "snoco_property_data.csv"
 OUTPUT_XLSX = "snoco_property_data.xlsx"
@@ -1582,15 +1601,102 @@ def _snoho_build(fields, raw_address):
     return data
 
 
+def _dd_rows(session, headers, module_id, p, a, m, summ_url):
+    """Fetch one DataDisplay table (by its ModuleId) from the parcel summary page
+    and return (column_set, list_of_row_dicts)."""
+    try:
+        r = session.get(SNOHO_DD_GETDATA, headers={
+            **headers, "ModuleId": str(module_id), "Referer": summ_url,
+            # Force JSON: the shared session Accept lists application/xml first,
+            # which makes this endpoint try (and fail) to serialize to XML (500).
+            "Accept": "application/json"},
+            params={"p": p, "a": a, "m": m, "itemsPerPage": "50", "page": "1"},
+            timeout=20)
+        r.raise_for_status()
+        j = r.json()
+    except Exception:
+        return set(), []
+    rows = []
+    for g in j.get("groups", []):
+        for row in g.get("rows", []):
+            rows.append({c.get("column"): c.get("value") for c in row.get("values", [])})
+    cols = {h.get("column") for h in j.get("headers", [])}
+    return cols, rows
+
+
+def snoho_fetch_detail(session, address_ctx, parcel, altkey, mapkey):
+    """Pull rich assessor detail (assessed value, market total, last sale date +
+    price, sales history, year built) for a Snohomish parcel from its Property
+    Account Summary page. Returns a master-schema dict (possibly partial); never
+    raises. The summary page hosts each fact as a DataDisplay JSON table, which we
+    identify by column name. (Beds/baths/finished sqft are not published on this
+    portal, so they remain blank.)"""
+    out = {}
+    summ = f"{SNOHO_SUMMARY_PAGE}?p={parcel}&a={altkey}&m={mapkey}"
+    try:
+        html = session.get(summ, timeout=25).text
+    except Exception as e:
+        print(f"  [WARNING] Snohomish detail page fetch failed: {e}")
+        return out
+    rvt = re.search(r'name="__RequestVerificationToken"[^>]*value="([^"]+)"', html)
+    tab = re.search(r"sf_tabId[^0-9]{0,4}(\d+)", html)
+    if not rvt or not tab:
+        return out
+    hdrs = {"TabId": tab.group(1), "RequestVerificationToken": rvt.group(1)}
+    module_ids = re.findall(r'<data-display-root moduleId="(\d+)"', html)
+
+    for mid in module_ids:
+        cols, rows = _dd_rows(session, hdrs, mid, parcel, altkey, mapkey, summ)
+        if not rows:
+            continue
+        # Value history: rows keyed by ValueDescription; the first value column
+        # (after the label) is the most recent assessment year.
+        if "ValueDescription" in cols:
+            valcol = next((c for c in ("Col2", "Col3") if c in cols), None)
+            for row in rows:
+                desc = (row.get("ValueDescription") or "").strip().lower()
+                amt = (row.get(valcol) or "").strip() if valcol else ""
+                if not amt:
+                    continue
+                if desc == "assessed value":
+                    out["Assessed Value"] = amt.lstrip("$")
+                elif desc == "market total":
+                    out["Market Total"] = amt.lstrip("$")
+                elif desc == "taxable value regular":
+                    out["Taxable Value Regular"] = amt.lstrip("$")
+        # Sale / transfer history: most recent row first.
+        elif "SaleDate" in cols:
+            hist = []
+            for row in rows:
+                d = (row.get("SaleDate") or "").split(" ")[0].strip()
+                price = (row.get("AdjustedSalesPrice") or "").strip()
+                form = (row.get("DocSubType") or row.get("ConveyanceForm") or "").strip()
+                if d:
+                    hist.append(f"{d}: ${price} ({form})" if price else f"{d}: {form}")
+            if rows:
+                top = rows[0]
+                out["Most Recent Sale Date"] = (top.get("SaleDate") or "").split(" ")[0].strip()
+                out["Most Recent Sale Amount"] = (top.get("AdjustedSalesPrice") or "").strip()
+            if hist:
+                out["Sales History"] = " | ".join(hist)
+        # Year built.
+        elif "YearBuilt" in cols:
+            yb = next((r.get("YearBuilt") for r in rows if (r.get("YearBuilt") or "").strip()), "")
+            if yb:
+                out["Year Built"] = str(yb).strip()
+    return out
+
+
 def scrape_property(session, address, base_resp, api_key=None, photo_folder="property_photos"):
-    """Look up an address in the Snohomish County Public Access portal (QuickSearch
-    JSON API) and return a data dict in the master schema, or None.
+    """Look up an address in the Snohomish County Public Access portal and return a
+    data dict in the master schema, or None.
 
     `base_resp` is the auth ctx dict from get_session(). v2.8.0 replaced the
-    retired snoco.org/proptax WebForms scrape. The search result carries parcel +
-    owner + situs (enough for ownership verification); rich assessor detail is not
-    in the public API and is left blank. Receives the RAW address (with city/zip)
-    and cleans it itself, the same split as the King County path."""
+    retired snoco.org/proptax WebForms scrape with the QuickSearch JSON API; v2.8.1
+    adds the rich detail (assessed value, last sale, year built, sales history) from
+    the parcel's Property Account Summary page. Beds/baths/finished sqft are not
+    published on this portal and stay blank. Receives the RAW address (with
+    city/zip) and cleans it itself, the same split as the King County path."""
     cleaned = clean_address_for_search(address)
     lead_city = _extract_city_segment(address)
     keyword = _snoho_keyword(cleaned)
@@ -1623,6 +1729,20 @@ def scrape_property(session, address, base_resp, api_key=None, photo_folder="pro
     print(f"  -> Parcel: {data.get('Parcel Number')}")
     print(f"  -> Owner:  {data.get('Owner 1 First Name','')} {data.get('Owner 1 Last Name','')}")
     print(f"  -> Situs:  {data.get('Property Address')}")
+
+    # Rich detail (assessed value, last sale, year built, sales history) from the
+    # parcel summary page. Best-effort: a detail hiccup never drops the lead, which
+    # still carries verified owner + parcel + address.
+    parcel = data.get("Parcel Number", "")
+    altkey = str(chosen.get("Altkey", "") or "")
+    mapkey = (chosen.get("MapKey") or parcel or "")
+    if parcel:
+        detail = snoho_fetch_detail(session, base_resp, parcel, altkey, mapkey)
+        data.update(detail)
+        print(f"  -> Assessed: {data.get('Assessed Value','N/A')} | "
+              f"Year built: {data.get('Year Built','N/A')} | "
+              f"Last sale: {data.get('Most Recent Sale Date','N/A')} "
+              f"for {data.get('Most Recent Sale Amount','N/A')}")
 
     # Street View photo (Google), same as the King County path.
     if api_key and data.get("Property Address"):
@@ -1906,7 +2026,7 @@ def main():
         sys.exit(1)
 
     # --- Setup ---
-    print(f"\nProperty Tax Scraper v2.8.0 (Snohomish web + King County LIVE)")
+    print(f"\nProperty Tax Scraper v2.8.1 (Snohomish web + King County LIVE)")
     print(f"{'='*50}")
     print(f"Properties to look up: {len(lookups)}")
 
